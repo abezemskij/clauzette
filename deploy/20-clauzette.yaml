@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clauzette
+  namespace: ai
+# No Kubernetes API token in the pod: exec_command could otherwise find it
+# and use it against the cluster.
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clauzette-config
+  namespace: ai
+data:
+  # Only values that differ from the built-in defaults; see config.example.json.
+  config.json: |
+    {
+      "ollama_url": "http://ollama.ai.svc.cluster.local:11434",
+      "model": "qwen3.8:27b",
+      "num_ctx": 131072,
+      "workspace": "/workspace",
+      "sessions_dir": "/state/sessions",
+      "audit_log": "/state/audit.jsonl",
+      "tools": { "shell": "/bin/bash" },
+      "gpu": {
+        "enabled": true,
+        "metrics_url": "http://nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400/metrics"
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clauzette
+  namespace: ai
+  labels: {app: clauzette}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: clauzette}
+  template:
+    metadata:
+      labels: {app: clauzette}
+    spec:
+      serviceAccountName: clauzette
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000            # files the agent creates stay usable by the group
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: clauzette
+          image: registry.local/clauzette:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["clauzette", "idle"]
+          env:
+            - {name: CLAUZETTE_CONFIG, value: /etc/clauzette/config.json}
+            - {name: HOME, value: /home/agent}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "4", memory: 4Gi, ephemeral-storage: 2Gi}
+          volumeMounts:
+            - {name: workspace, mountPath: /workspace}
+            - {name: state, mountPath: /state}
+            - {name: config, mountPath: /etc/clauzette, readOnly: true}
+            - {name: home, mountPath: /home/agent}   # writable HOME for git, caches
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: shared-workspace   # your shared space
+        - name: state
+          persistentVolumeClaim:
+            claimName: clauzette-state       # sessions + audit log
+        - name: config
+          configMap:
+            name: clauzette-config
+        - name: home
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {sizeLimit: 1Gi}

@@ -1,0 +1,11 @@
+# Local state — never committed: transcripts, audit log, local config,
+# the compiled binary and the per-machine workspace.
+bin/
+.local/
+scratch/
+clauzette.local.json
+
+# Editor and OS noise
+*.swp
+*.swo
+.DS_Store

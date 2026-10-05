@@ -1,0 +1,69 @@
+{
+  "ollama_url": "http://127.0.0.1:11434",
+  "model": "qwen3.8:27b",
+  "num_ctx": 200000,
+  "keep_alive": "1h",
+  "options": {},
+  "think": true,
+  "show_thinking": false,
+  "warmup_prefill": false,
+
+  "workspace": "/workspace",
+  "sessions_dir": "/state/sessions",
+  "audit_log": "/state/audit.jsonl",
+  "color": "auto",
+
+  "prompt": {
+    "base_file": "",
+    "extra_file": "",
+    "project_files": ["AGENTS.md", "CLAUDE.md"],
+    "project_max_bytes": 20000,
+    "internet_access": false
+  },
+  "context": {
+    "compact_at_tokens": 100000,
+    "compact_target_tokens": 40000,
+    "keep_recent_tokens": 20000,
+    "reserve_tokens": 8192,
+    "reserve_tokens_thinking": 24576,
+    "elide_tool_results_over_chars": 600,
+    "summary_chunk_tokens": 60000
+  },
+  "timeouts": {
+    "connect_seconds": 5,
+    "first_token_seconds": 1200,
+    "inter_token_seconds": 600,
+    "load_seconds": 900
+  },
+  "agent": {
+    "max_steps": 100
+  },
+  "tools": {
+    "shell": "/bin/bash",
+    "exec_default_timeout_seconds": 120,
+    "exec_max_timeout_seconds": 1800,
+    "max_output_bytes": 30000,
+    "read_default_lines": 400,
+    "read_max_file_bytes": 10485760,
+    "auto_approve": [],
+    "disabled": []
+  },
+  "safe": {
+    "max_backups": 20
+  },
+  "gpu": {
+    "enabled": false,
+    "metrics_url": "http://nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400/metrics",
+    "mode": "temperature",
+    "temp_metric": "DCGM_FI_DEV_GPU_TEMP",
+    "util_metric": "DCGM_FI_DEV_GPU_UTIL",
+    "util_scale": 1,
+    "pause_above_c": 80,
+    "resume_below_c": 70,
+    "util_threshold": 95,
+    "util_window_seconds": 60,
+    "util_pause_seconds": 60,
+    "sample_seconds": 5,
+    "max_pause_seconds": 900
+  }
+}

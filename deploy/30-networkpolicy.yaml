@@ -1,0 +1,39 @@
+# The agent pod may talk to DNS, Ollama and the GPU metrics exporter, and
+# nothing else; nothing may connect to it. Only enforced if your CNI
+# supports NetworkPolicy (Calico, Cilium, ...).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clauzette
+  namespace: ai
+spec:
+  podSelector:
+    matchLabels: {app: clauzette}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchLabels: {app: ollama}
+      ports:
+        - {protocol: TCP, port: 11434}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: gpu-operator}
+      ports:
+        - {protocol: TCP, port: 9400}
+    # Internet access for commands (package installs, git clone) is a
+    # deliberate choice: it also lets prompt-injected commands send data
+    # out. To allow it, uncomment:
+    # - to:
+    #     - ipBlock:
+    #         cidr: 0.0.0.0/0
+    #         except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]

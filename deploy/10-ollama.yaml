@@ -1,0 +1,78 @@
+# Ollama on the control-plane node with the Titan RTX.
+# Skip this file if Ollama already runs in your cluster; just make sure the
+# environment variables below are set and a Service named "ollama" exists.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: ai
+  labels: {app: ollama}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: ollama}
+  template:
+    metadata:
+      labels: {app: ollama}
+    spec:
+      # runtimeClassName: nvidia     # needed if your containerd uses a separate NVIDIA runtime class
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: ollama
+          image: ollama/ollama:0.32.12   # Qwen3.8 support starts here; newer is fine
+          ports:
+            - {name: http, containerPort: 11434}
+          env:
+            - {name: OLLAMA_HOST, value: "0.0.0.0:11434"}
+            - {name: OLLAMA_FLASH_ATTENTION, value: "1"}
+            - {name: OLLAMA_KV_CACHE_TYPE, value: "q8_0"}   # halves KV cache memory
+            - {name: OLLAMA_NUM_PARALLEL, value: "1"}       # each slot needs its own full context
+            - {name: OLLAMA_MAX_LOADED_MODELS, value: "1"}
+            - {name: OLLAMA_KEEP_ALIVE, value: "24h"}
+          resources:
+            # The control plane shares this node: keep Ollama from starving it.
+            requests: {cpu: "2", memory: 8Gi}
+            limits: {memory: 32Gi, nvidia.com/gpu: 1}   # adjust memory to the node
+          readinessProbe:
+            httpGet: {path: /api/version, port: http}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: models, mountPath: /root/.ollama}
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ollama-models   # your storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: ai
+spec:
+  selector: {app: ollama}
+  ports:
+    - {name: http, port: 11434, targetPort: http}
+---
+# One-off model download through the Service.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ollama-pull-qwen38
+  namespace: ai
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: pull
+          image: ollama/ollama:0.32.12
+          command: ["ollama", "pull", "qwen3.8:27b"]
+          env:
+            - {name: OLLAMA_HOST, value: "http://ollama.ai.svc.cluster.local:11434"}
