@@ -9,7 +9,7 @@ func TestParseMetricLine(t *testing.T) {
 		val  float64
 		ok   bool
 	}{
-		{`DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-1",modelName="TITAN RTX"} 67`, "DCGM_FI_DEV_GPU_TEMP", 67, true},
+		{`DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-1",modelName="NVIDIA GPU"} 67`, "DCGM_FI_DEV_GPU_TEMP", 67, true},
 		{`nvidia_smi_utilization_gpu_ratio{uuid="x"} 0.98 1700000000000`, "nvidia_smi_utilization_gpu_ratio", 0.98, true},
 		{`plain_metric 12.5`, "plain_metric", 12.5, true},
 		{`broken{label="x"`, "", 0, false},

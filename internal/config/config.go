@@ -117,9 +117,6 @@ type GPUConfig struct {
 	MaxPauseSec   int     `json:"max_pause_seconds"`
 }
 
-/* "ollama_url": "http://127.0.0.1:11434",
-"model": "qwen3.8-128k:latest", #"qwen3.8:27b", */
-
 func Defaults() *Config {
 	return &Config{
 		OllamaURL:    "http://127.0.0.1:11434",

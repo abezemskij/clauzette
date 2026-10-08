@@ -1,4 +1,4 @@
-# Ollama on the control-plane node with the Titan RTX.
+# Ollama on the control-plane node with the GPU.
 # Skip this file if Ollama already runs in your cluster; just make sure the
 # environment variables below are set and a Service named "ollama" exists.
 apiVersion: apps/v1

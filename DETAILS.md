@@ -28,7 +28,7 @@ ssh master → tmux → kubectl exec -it deploy/clauzette -- clauzette
                     │ ollama  streaming client, phased timeouts
                     │ gpu     exporter sampling, cool-down pauses
                     └──────────────┬──────────────┘
-                     Service ollama:11434 (pod on the master, Titan RTX)
+                     Service ollama:11434 (Ollama pod on the GPU node)
 ```
 
 The `agent` package has no terminal code. It reports everything as events and receives approval decisions through a channel, so a network server or web front end could later drive the same core.
@@ -169,7 +169,7 @@ kubectl -n ai run curl --rm -it --image=curlimages/curl --restart=Never -- \
   curl -s http://nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400/metrics | grep -i -E 'temp|util'
 ```
 
-NVIDIA's DCGM exporter targets data-center GPUs and may report only part of its metrics for a Titan RTX. If temperature is missing, use an exporter built on `nvidia-smi` and set `gpu.temp_metric` and `gpu.util_metric` to its names (and `gpu.util_scale` to 100 if it reports utilization as 0–1). Then `/gpu` in clauzette shows the current reading.
+NVIDIA's DCGM exporter targets data-center GPUs and may report only part of its metrics for a consumer GPU. If temperature is missing, use an exporter built on `nvidia-smi` and set `gpu.temp_metric` and `gpu.util_metric` to its names (and `gpu.util_scale` to 100 if it reports utilization as 0–1). Then `/gpu` in clauzette shows the current reading.
 
 ## Using it
 
