@@ -66,8 +66,9 @@ type Event struct {
 // the process's output goes to your terminal, not to the pod log, so a file
 // on persistent storage is the reliable place for the record.
 type Audit struct {
-	mu sync.Mutex
-	f  *os.File
+	Agent string // added to every record when set, for a log shared by several agents
+	mu    sync.Mutex
+	f     *os.File
 }
 
 func OpenAudit(path string) (*Audit, error) {
@@ -89,6 +90,9 @@ func (a *Audit) Log(fields map[string]any) {
 		return
 	}
 	fields["time"] = time.Now().Format(time.RFC3339)
+	if a.Agent != "" {
+		fields["agent"] = a.Agent
+	}
 	b, err := json.Marshal(fields)
 	if err != nil {
 		return

@@ -1,5 +1,5 @@
 # --- build ------------------------------------------------------------------
-FROM golang:1.22-bookworm AS build
+FROM golang:1.26-bookworm AS build
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod ./

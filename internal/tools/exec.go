@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -64,10 +65,12 @@ func (t *ExecCommand) Prepare(_ context.Context, args Args) (*Action, error) {
 	}
 	dir := t.WS.Root
 	if wd != "" {
-		if dir, err = t.WS.Resolve(wd); err != nil {
+		loc, err := t.WS.Resolve(wd, AccessRead)
+		if err != nil {
 			return nil, err
 		}
-		st, err := os.Stat(dir)
+		dir = loc.Abs
+		st, err := loc.Stat()
 		if err != nil {
 			return nil, cleanErr(err, t.WS.Rel(dir))
 		}
@@ -117,6 +120,9 @@ func (t *ExecCommand) run(ctx context.Context, command, dir string, timeout time
 	case <-done:
 	case <-ctx.Done():
 		stopReason = "was cancelled by the operator"
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			stopReason = "was stopped because the time limit was reached"
+		}
 		terminateGroup(pgid, done)
 	case <-timer.C:
 		stopReason = fmt.Sprintf("timed out after %s and was stopped", timeout)

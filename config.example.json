@@ -9,12 +9,16 @@
   "warmup_prefill": false,
 
   "workspace": "/workspace",
+  "agent_id": "",
+  "agent_dir": false,
+  "shared_access": "read",
   "sessions_dir": "/state/sessions",
   "audit_log": "/state/audit.jsonl",
   "color": "auto",
 
   "prompt": {
     "base_file": "",
+    "rogue_base_file": "",
     "extra_file": "",
     "project_files": ["AGENTS.md", "CLAUDE.md"],
     "project_max_bytes": 20000,
@@ -24,6 +28,7 @@
     "compact_at_tokens": 100000,
     "compact_target_tokens": 40000,
     "keep_recent_tokens": 20000,
+    "keep_recent_ratio": 0,
     "reserve_tokens": 8192,
     "reserve_tokens_thinking": 24576,
     "elide_tool_results_over_chars": 600,
@@ -50,6 +55,9 @@
   },
   "safe": {
     "max_backups": 20
+  },
+  "rogue": {
+    "max_minutes": 60
   },
   "gpu": {
     "enabled": false,

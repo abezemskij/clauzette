@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDiffUnchanged(t *testing.T) {
@@ -56,20 +57,25 @@ func TestResolveConfinement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ws.Resolve("a/new/file.txt"); err != nil {
+	if _, err := ws.Resolve("a/new/file.txt", AccessWrite); err != nil {
 		t.Fatalf("new file inside workspace rejected: %v", err)
 	}
-	if _, err := ws.Resolve("../outside"); err == nil {
+	if _, err := ws.Resolve("../outside", AccessRead); err == nil {
 		t.Fatal("../outside was accepted")
 	}
-	if _, err := ws.Resolve("/etc/passwd"); err == nil {
+	if _, err := ws.Resolve("/etc/passwd", AccessRead); err == nil {
 		t.Fatal("/etc/passwd was accepted")
 	}
 	if err := os.Symlink("/etc", filepath.Join(root, "link")); err != nil {
 		t.Skip("cannot create symlink:", err)
 	}
-	if _, err := ws.Resolve("link/passwd"); err == nil {
-		t.Fatal("symlink escape was accepted")
+	// Resolve does not touch the disk; the escape is refused by the read itself.
+	read := &ReadFile{WS: ws, DefaultLines: 10}
+	act, err := read.Prepare(context.Background(), Args{"path": "link/passwd"})
+	if err == nil {
+		if _, err = act.Run(context.Background()); err == nil {
+			t.Fatal("symlink escape was read")
+		}
 	}
 }
 
@@ -233,5 +239,20 @@ func TestCappedBuffer(t *testing.T) {
 	}
 	if !strings.Contains(s, "2000 bytes omitted") {
 		t.Fatalf("missing omission note in %q", s[480:560])
+	}
+}
+
+func TestExecStoppedByDeadline(t *testing.T) {
+	ws, _ := NewWorkspace(t.TempDir())
+	ex := &ExecCommand{WS: ws, Shell: "/bin/sh", DefaultTimeout: time.Minute, MaxTimeout: time.Minute, MaxOutput: 1000}
+	act, err := ex.Prepare(context.Background(), Args{"command": "sleep 30"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	out, _ := act.Run(ctx)
+	if !strings.Contains(out, "time limit") {
+		t.Fatalf("a command stopped by a deadline should say so: %q", out)
 	}
 }

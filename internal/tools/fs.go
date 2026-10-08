@@ -6,10 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
+	"path"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 
 	"clauzette/internal/textutil"
@@ -98,21 +97,21 @@ func (t *ReadFile) Prepare(_ context.Context, args Args) (*Action, error) {
 	if limit <= 0 {
 		limit = t.DefaultLines
 	}
-	path, err := t.WS.Resolve(p)
+	loc, err := t.WS.ResolveFile(p, AccessRead)
 	if err != nil {
 		return nil, err
 	}
-	rel := t.WS.Rel(path)
+	rel := t.WS.Rel(loc.Abs)
 	return &Action{
 		Summary: "read " + rel,
 		Run: func(context.Context) (string, error) {
-			return t.read(path, rel, offset, limit)
+			return t.read(loc, rel, offset, limit)
 		},
 	}, nil
 }
 
-func (t *ReadFile) read(path, rel string, offset, limit int) (string, error) {
-	st, err := os.Stat(path)
+func (t *ReadFile) read(loc Loc, rel string, offset, limit int) (string, error) {
+	st, err := loc.Stat()
 	if err != nil {
 		return "", cleanErr(err, rel)
 	}
@@ -123,14 +122,14 @@ func (t *ReadFile) read(path, rel string, offset, limit int) (string, error) {
 		return "", fmt.Errorf("%s is %s, over the %s read limit; inspect parts of it with search_files or exec_command (head, sed -n)",
 			rel, textutil.HumanBytes(st.Size()), textutil.HumanBytes(t.MaxBytes))
 	}
-	b, err := os.ReadFile(path)
+	b, err := loc.ReadFile()
 	if err != nil {
 		return "", cleanErr(err, rel)
 	}
 	if isBinary(b) {
 		return fmt.Sprintf("%s is a binary file (%s); contents not shown.", rel, textutil.HumanBytes(int64(len(b)))), nil
 	}
-	t.WS.markSeen(path, b)
+	t.WS.markSeen(loc.Abs, b)
 	lines := splitLines(string(b))
 	total := len(lines)
 	if total == 0 {
@@ -198,21 +197,21 @@ func (t *ListDir) Prepare(_ context.Context, args Args) (*Action, error) {
 	if depth > 6 {
 		depth = 6
 	}
-	root, err := t.WS.Resolve(p)
+	loc, err := t.WS.Resolve(p, AccessRead)
 	if err != nil {
 		return nil, err
 	}
-	rel := t.WS.Rel(root)
+	rel := t.WS.Rel(loc.Abs)
 	return &Action{
 		Summary: "list " + rel,
 		Run: func(ctx context.Context) (string, error) {
-			return t.list(ctx, root, rel, depth)
+			return t.list(ctx, loc, rel, depth)
 		},
 	}, nil
 }
 
-func (t *ListDir) list(ctx context.Context, root, rel string, maxDepth int) (string, error) {
-	st, err := os.Stat(root)
+func (t *ListDir) list(ctx context.Context, loc Loc, rel string, maxDepth int) (string, error) {
+	st, err := loc.Stat()
 	if err != nil {
 		return "", cleanErr(err, rel)
 	}
@@ -224,18 +223,18 @@ func (t *ListDir) list(ctx context.Context, root, rel string, maxDepth int) (str
 	fmt.Fprintf(&sb, "%s/\n", rel)
 	count := 0
 	truncated := false
-	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	err = fs.WalkDir(loc.FS(), loc.Name, func(p string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if p == root {
+		if p == loc.Name {
 			return err
 		}
-		r, _ := filepath.Rel(root, p)
-		depth := strings.Count(r, string(filepath.Separator))
+		r := relName(loc.Name, p)
+		depth := strings.Count(r, "/")
 		indent := strings.Repeat("  ", depth+1)
 		if err != nil {
-			fmt.Fprintf(&sb, "%s%s [unreadable: %v]\n", indent, filepath.Base(p), err)
+			fmt.Fprintf(&sb, "%s%s [unreadable: %v]\n", indent, path.Base(p), err)
 			if d != nil && d.IsDir() {
 				return fs.SkipDir
 			}
@@ -256,7 +255,7 @@ func (t *ListDir) list(ctx context.Context, root, rel string, maxDepth int) (str
 		case d.IsDir():
 			fmt.Fprintf(&sb, "%s%s/\n", indent, d.Name())
 		case d.Type()&fs.ModeSymlink != 0:
-			target, _ := os.Readlink(p)
+			target, _ := loc.Child(p).Readlink()
 			fmt.Fprintf(&sb, "%s%s -> %s\n", indent, d.Name(), target)
 		default:
 			size := ""
@@ -268,7 +267,7 @@ func (t *ListDir) list(ctx context.Context, root, rel string, maxDepth int) (str
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return "", cleanErr(err, rel)
 	}
 	if count == 0 {
 		sb.WriteString("  (empty)\n")
@@ -346,28 +345,29 @@ func (t *SearchFiles) Prepare(_ context.Context, args Args) (*Action, error) {
 			return nil, fmt.Errorf("invalid glob %q: %v", glob, err)
 		}
 	}
-	root, err := t.WS.Resolve(p)
+	loc, err := t.WS.Resolve(p, AccessRead)
 	if err != nil {
 		return nil, err
 	}
 	return &Action{
-		Summary: fmt.Sprintf("search /%s/ in %s", pattern, t.WS.Rel(root)),
+		Summary: fmt.Sprintf("search /%s/ in %s", pattern, t.WS.Rel(loc.Abs)),
 		Run: func(ctx context.Context) (string, error) {
-			return t.search(ctx, root, re, pattern, glob, max)
+			return t.search(ctx, loc, re, pattern, glob, max)
 		},
 	}, nil
 }
 
-func (t *SearchFiles) search(ctx context.Context, root string, re *regexp.Regexp, pattern, glob string, max int) (string, error) {
+func (t *SearchFiles) search(ctx context.Context, loc Loc, re *regexp.Regexp, pattern, glob string, max int) (string, error) {
 	var sb strings.Builder
 	count, files := 0, 0
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	fsys := loc.FS()
+	err := fs.WalkDir(fsys, loc.Name, func(p string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if err != nil {
-			if p == root {
-				return cleanErr(err, t.WS.Rel(p))
+			if p == loc.Name {
+				return cleanErr(err, t.WS.Rel(loc.Abs))
 			}
 			if d != nil && d.IsDir() {
 				return fs.SkipDir
@@ -375,7 +375,7 @@ func (t *SearchFiles) search(ctx context.Context, root string, re *regexp.Regexp
 			return nil
 		}
 		if d.IsDir() {
-			if p != root && skipDirs[d.Name()] {
+			if p != loc.Name && skipDirs[d.Name()] {
 				return fs.SkipDir
 			}
 			return nil
@@ -392,12 +392,12 @@ func (t *SearchFiles) search(ctx context.Context, root string, re *regexp.Regexp
 		if err != nil || info.Size() > 2<<20 {
 			return nil
 		}
-		b, err := os.ReadFile(p)
+		b, err := fs.ReadFile(fsys, p)
 		if err != nil || isBinary(b) {
 			return nil
 		}
 		files++
-		rel := t.WS.Rel(p)
+		rel := t.WS.Rel(loc.Child(p).Abs)
 		for i, line := range splitLines(string(b)) {
 			if re.MatchString(line) {
 				fmt.Fprintf(&sb, "%s:%d: %s\n", rel, i+1, textutil.Truncate(strings.TrimSpace(line), 300))
@@ -452,13 +452,13 @@ func (t *WriteFile) Prepare(_ context.Context, args Args) (*Action, error) {
 	if err != nil {
 		return nil, err
 	}
-	path, err := t.WS.Resolve(p)
+	loc, err := t.WS.ResolveFile(p, AccessWrite)
 	if err != nil {
 		return nil, err
 	}
-	rel := t.WS.Rel(path)
+	path, rel := loc.Abs, t.WS.Rel(loc.Abs)
 
-	st, statErr := os.Stat(path)
+	st, statErr := loc.Stat()
 	exists := statErr == nil
 	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
 		return nil, cleanErr(statErr, rel)
@@ -470,7 +470,7 @@ func (t *WriteFile) Prepare(_ context.Context, args Args) (*Action, error) {
 			return nil, fmt.Errorf("%s is a directory", rel)
 		}
 		perm = st.Mode().Perm()
-		if old, err = os.ReadFile(path); err != nil {
+		if old, err = loc.ReadFile(); err != nil {
 			return nil, cleanErr(err, rel)
 		}
 		h, seen := t.WS.seenHash(path)
@@ -498,7 +498,7 @@ func (t *WriteFile) Prepare(_ context.Context, args Args) (*Action, error) {
 		Preview: preview,
 		Run: func(context.Context) (string, error) {
 			// Approval can take a while; make sure nobody changed the file meanwhile.
-			cur, err := os.ReadFile(path)
+			cur, err := loc.ReadFile()
 			switch {
 			case exists && err != nil:
 				return "", fmt.Errorf("%s could not be re-read before writing: %v", rel, err)
@@ -507,11 +507,11 @@ func (t *WriteFile) Prepare(_ context.Context, args Args) (*Action, error) {
 			case !exists && err == nil:
 				return "", fmt.Errorf("%s was created by someone else while waiting for approval; read it first", rel)
 			}
-			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-				return "", err
+			if err := loc.MkdirParents(); err != nil {
+				return "", cleanErr(err, rel)
 			}
-			if err := writeAtomic(path, []byte(content), perm); err != nil {
-				return "", err
+			if err := t.WS.writeAtomic(loc, []byte(content), perm); err != nil {
+				return "", cleanErr(err, rel)
 			}
 			t.WS.markSeen(path, []byte(content))
 			verb := "Created"
@@ -574,12 +574,12 @@ func (t *EditFile) Prepare(_ context.Context, args Args) (*Action, error) {
 	if oldText == newText {
 		return nil, errors.New("old_text and new_text are identical; nothing to change")
 	}
-	path, err := t.WS.Resolve(p)
+	loc, err := t.WS.ResolveFile(p, AccessWrite)
 	if err != nil {
 		return nil, err
 	}
-	rel := t.WS.Rel(path)
-	st, err := os.Stat(path)
+	path, rel := loc.Abs, t.WS.Rel(loc.Abs)
+	st, err := loc.Stat()
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("%s does not exist; use write_file to create it", rel)
@@ -589,7 +589,7 @@ func (t *EditFile) Prepare(_ context.Context, args Args) (*Action, error) {
 	if st.IsDir() {
 		return nil, fmt.Errorf("%s is a directory", rel)
 	}
-	b, err := os.ReadFile(path)
+	b, err := loc.ReadFile()
 	if err != nil {
 		return nil, cleanErr(err, rel)
 	}
@@ -629,15 +629,15 @@ func (t *EditFile) Prepare(_ context.Context, args Args) (*Action, error) {
 		Summary: fmt.Sprintf("edit %s (%d replacement%s, +%d -%d lines)", rel, replaced, plural(replaced), added, removed),
 		Preview: preview,
 		Run: func(context.Context) (string, error) {
-			cur, err := os.ReadFile(path)
+			cur, err := loc.ReadFile()
 			if err != nil {
 				return "", cleanErr(err, rel)
 			}
 			if hashBytes(cur) != oldHash {
 				return "", fmt.Errorf("%s changed on disk while waiting for approval; read it again and redo the edit", rel)
 			}
-			if err := writeAtomic(path, []byte(updated), perm); err != nil {
-				return "", err
+			if err := t.WS.writeAtomic(loc, []byte(updated), perm); err != nil {
+				return "", cleanErr(err, rel)
 			}
 			t.WS.markSeen(path, []byte(updated))
 			return fmt.Sprintf("Edited %s: %d replacement%s (+%d -%d lines).", rel, replaced, plural(replaced), added, removed), nil
@@ -662,9 +662,9 @@ func occurrenceLines(s, sub string, max int) string {
 
 // dirFileCount reports how many regular files and how many total bytes are
 // under a directory.
-func dirFileCount(root string) (int, int64) {
+func dirFileCount(loc Loc) (int, int64) {
 	n, size := 0, int64(0)
-	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	fs.WalkDir(loc.FS(), loc.Name, func(p string, d fs.DirEntry, err error) error {
 		if err == nil && d != nil && !d.IsDir() {
 			n++
 			if info, ierr := d.Info(); ierr == nil {
@@ -681,6 +681,40 @@ func kindName(isDir bool) string {
 		return "directory"
 	}
 	return "file"
+}
+
+// relName returns name relative to the walk root dir, both as passed to an
+// fs.WalkDir callback.
+func relName(dir, name string) string {
+	if dir == "." {
+		return name
+	}
+	return strings.TrimPrefix(name, dir+"/")
+}
+
+// entryKind describes what an Lstat result is, for comparing it before and
+// after an approval.
+func entryKind(fi fs.FileInfo) string {
+	switch {
+	case fi.Mode()&fs.ModeSymlink != 0:
+		return "symlink"
+	case fi.IsDir():
+		return "directory"
+	}
+	return "file"
+}
+
+// walkFiles lists the absolute paths of the non-directory entries under loc
+// (loc itself if it is not a directory), without following symlinks.
+func walkFiles(loc Loc) []string {
+	var out []string
+	fs.WalkDir(loc.FS(), loc.Name, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d != nil && !d.IsDir() {
+			out = append(out, loc.Child(p).Abs)
+		}
+		return nil
+	})
+	return out
 }
 
 // ------------------------------------------------------------------ mv_file
@@ -715,83 +749,100 @@ func (t *MvFile) Prepare(_ context.Context, args Args) (*Action, error) {
 	if err != nil {
 		return nil, err
 	}
-	src, err := t.WS.Resolve(from)
+	// Neither side follows a final symlink: moving a link moves the link.
+	src, err := t.WS.Resolve(from, AccessWrite)
 	if err != nil {
 		return nil, err
 	}
-	dst, err := t.WS.Resolve(to)
+	dst, err := t.WS.Resolve(to, AccessWrite)
 	if err != nil {
 		return nil, err
 	}
-	relSrc := t.WS.Rel(src)
-	st, err := os.Stat(src)
+	relSrc := t.WS.Rel(src.Abs)
+	if src.IsRoot() || src.IsAgentDir() {
+		return nil, errors.New("that is the workspace root itself; choose a path inside it")
+	}
+	st, err := src.Lstat()
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("%s does not exist", relSrc)
 		}
 		return nil, cleanErr(err, relSrc)
 	}
-	dstSt, err := os.Lstat(dst)
-	if err == nil {
-		if src == dst {
+	kind := entryKind(st)
+	if dstSt, err := dst.Lstat(); err == nil {
+		if src.Abs == dst.Abs {
 			return nil, errors.New("source and destination are the same path")
 		}
 		if dstSt.IsDir() {
-			entries, rerr := os.ReadDir(dst)
+			entries, rerr := dst.ReadDir()
 			if rerr != nil {
-				return nil, cleanErr(rerr, t.WS.Rel(dst))
+				return nil, cleanErr(rerr, t.WS.Rel(dst.Abs))
 			}
 			if len(entries) != 0 {
 				return nil, fmt.Errorf("%s exists and is not empty; to move into it, use a new name inside it, e.g. %s/%s",
-					t.WS.Rel(dst), t.WS.Rel(dst), filepath.Base(src))
+					t.WS.Rel(dst.Abs), t.WS.Rel(dst.Abs), path.Base(src.Name))
 			}
-			dst = filepath.Join(dst, filepath.Base(src))
+			dst = dst.Child(path.Join(dst.Name, path.Base(src.Name)))
 		} else {
-			return nil, fmt.Errorf("%s already exists; choose a different name or delete it first", t.WS.Rel(dst))
+			return nil, fmt.Errorf("%s already exists; choose a different name or delete it first", t.WS.Rel(dst.Abs))
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, cleanErr(err, t.WS.Rel(dst))
+		return nil, cleanErr(err, t.WS.Rel(dst.Abs))
 	}
-	relDst := t.WS.Rel(dst)
+	relDst := t.WS.Rel(dst.Abs)
+
 	var content []byte
-	var summary string
-	if st.IsDir() {
+	var summary, linkTarget string
+	var backups []BackupRef
+	switch kind {
+	case "directory":
 		n, size := dirFileCount(src)
 		summary = fmt.Sprintf("move %s/ to %s/ (%d file%s, %s)", relSrc, relDst, n, plural(n), textutil.HumanBytes(size))
-	} else {
-		b, err := os.ReadFile(src)
+		backups = []BackupRef{src.BackupRef()}
+	case "symlink":
+		linkTarget, _ = src.Readlink()
+		summary = fmt.Sprintf("move the symlink %s (-> %s) to %s; its target is not touched", relSrc, linkTarget, relDst)
+	default:
+		b, err := src.ReadFile()
 		if err != nil {
 			return nil, cleanErr(err, relSrc)
 		}
 		content = b
 		lines := len(splitLines(string(b)))
 		summary = fmt.Sprintf("move %s to %s (%d line%s)", relSrc, relDst, lines, plural(lines))
+		backups = []BackupRef{src.BackupRef()}
 	}
 	oldHash := hashBytes(content)
 
 	return &Action{
 		Summary: summary,
-		Backups: []BackupRef{{Abs: src, Rel: relSrc}},
+		Backups: backups,
 		Run: func(context.Context) (string, error) {
-			curSt, err := os.Stat(src)
+			curSt, err := src.Lstat()
 			if err != nil {
 				return "", cleanErr(err, relSrc)
 			}
-			if curSt.IsDir() != st.IsDir() {
-				return "", fmt.Errorf("%s is no longer a %s; look at it again", relSrc, kindName(st.IsDir()))
+			if entryKind(curSt) != kind {
+				return "", fmt.Errorf("%s is no longer a %s; look at it again", relSrc, kind)
 			}
-			if !st.IsDir() {
-				cur, err := os.ReadFile(src)
+			switch kind {
+			case "file":
+				cur, err := src.ReadFile()
 				if err != nil {
 					return "", cleanErr(err, relSrc)
 				}
 				if hashBytes(cur) != oldHash {
 					return "", fmt.Errorf("%s changed on disk while waiting for approval; look at it again", relSrc)
 				}
+			case "symlink":
+				if cur, _ := src.Readlink(); cur != linkTarget {
+					return "", fmt.Errorf("the symlink %s changed while waiting for approval; look at it again", relSrc)
+				}
 			}
-			if dstSt, err := os.Lstat(dst); err == nil {
+			if dstSt, err := dst.Lstat(); err == nil {
 				if dstSt.IsDir() {
-					entries, rerr := os.ReadDir(dst)
+					entries, rerr := dst.ReadDir()
 					if rerr != nil {
 						return "", cleanErr(rerr, relDst)
 					}
@@ -804,26 +855,16 @@ func (t *MvFile) Prepare(_ context.Context, args Args) (*Action, error) {
 			} else if !errors.Is(err, fs.ErrNotExist) {
 				return "", cleanErr(err, relDst)
 			}
-			var oldFiles []string
-			if st.IsDir() {
-				filepath.WalkDir(src, func(p string, d fs.DirEntry, werr error) error {
-					if werr == nil && d != nil && !d.IsDir() {
-						oldFiles = append(oldFiles, p)
-					}
-					return nil
-				})
-			} else {
-				oldFiles = []string{src}
-			}
-			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			oldFiles := walkFiles(src)
+			if err := dst.MkdirParents(); err != nil {
 				return "", cleanErr(err, relDst)
 			}
-			if err := os.Rename(src, dst); err != nil {
+			if err := src.Rename(dst); err != nil {
 				return "", cleanErr(err, relDst)
 			}
 			t.WS.unmark(oldFiles...)
-			if !st.IsDir() {
-				t.WS.markSeen(dst, content)
+			if kind == "file" {
+				t.WS.markSeen(dst.Abs, content)
 			}
 			return fmt.Sprintf("Moved %s to %s.", relSrc, relDst), nil
 		},
@@ -861,26 +902,30 @@ func (t *DeleteFile) Prepare(_ context.Context, args Args) (*Action, error) {
 	if err != nil {
 		return nil, err
 	}
-	path, err := t.WS.Resolve(p)
+	// The final component is not followed: deleting a link deletes the link.
+	loc, err := t.WS.Resolve(p, AccessWrite)
 	if err != nil {
 		return nil, err
 	}
-	rel := t.WS.Rel(path)
-	if rel == "." {
+	rel := t.WS.Rel(loc.Abs)
+	if loc.IsRoot() || loc.IsAgentDir() {
 		return nil, errors.New("that is the workspace root itself; choose a path inside it")
 	}
-	st, err := os.Stat(path)
+	st, err := loc.Lstat()
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("%s does not exist", rel)
 		}
 		return nil, cleanErr(err, rel)
 	}
+	kind := entryKind(st)
 	var content []byte
-	var summary string
-	if st.IsDir() {
+	var summary, linkTarget string
+	var backups []BackupRef
+	switch kind {
+	case "directory":
 		if !recursive {
-			entries, rerr := os.ReadDir(path)
+			entries, rerr := loc.ReadDir()
 			if rerr != nil {
 				return nil, cleanErr(rerr, rel)
 			}
@@ -888,33 +933,39 @@ func (t *DeleteFile) Prepare(_ context.Context, args Args) (*Action, error) {
 				return nil, fmt.Errorf("%s is a directory with %d entries; pass recursive=true to delete it and everything inside", rel, len(entries))
 			}
 		}
-		n, size := dirFileCount(path)
+		n, size := dirFileCount(loc)
 		summary = fmt.Sprintf("delete %s/ (%d file%s, %s)", rel, n, plural(n), textutil.HumanBytes(size))
-	} else {
-		b, err := os.ReadFile(path)
+		backups = []BackupRef{loc.BackupRef()}
+	case "symlink":
+		linkTarget, _ = loc.Readlink()
+		summary = fmt.Sprintf("delete the symlink %s (-> %s); its target is not touched", rel, linkTarget)
+	default:
+		b, err := loc.ReadFile()
 		if err != nil {
 			return nil, cleanErr(err, rel)
 		}
 		content = b
 		lines := len(splitLines(string(b)))
 		summary = fmt.Sprintf("delete %s (%d line%s, %s)", rel, lines, plural(lines), textutil.HumanBytes(int64(len(b))))
+		backups = []BackupRef{loc.BackupRef()}
 	}
 	oldHash := hashBytes(content)
 
 	return &Action{
 		Summary: summary,
-		Backups: []BackupRef{{Abs: path, Rel: rel}},
+		Backups: backups,
 		Run: func(context.Context) (string, error) {
-			curSt, err := os.Stat(path)
+			curSt, err := loc.Lstat()
 			if err != nil {
 				return "", cleanErr(err, rel)
 			}
-			if curSt.IsDir() != st.IsDir() {
-				return "", fmt.Errorf("%s is no longer a %s; look at it again", rel, kindName(st.IsDir()))
+			if entryKind(curSt) != kind {
+				return "", fmt.Errorf("%s is no longer a %s; look at it again", rel, kind)
 			}
-			if st.IsDir() {
+			switch kind {
+			case "directory":
 				if !recursive {
-					entries, rerr := os.ReadDir(path)
+					entries, rerr := loc.ReadDir()
 					if rerr != nil {
 						return "", cleanErr(rerr, rel)
 					}
@@ -922,8 +973,12 @@ func (t *DeleteFile) Prepare(_ context.Context, args Args) (*Action, error) {
 						return "", fmt.Errorf("%s is no longer empty; pass recursive=true", rel)
 					}
 				}
-			} else {
-				cur, err := os.ReadFile(path)
+			case "symlink":
+				if cur, _ := loc.Readlink(); cur != linkTarget {
+					return "", fmt.Errorf("the symlink %s changed while waiting for approval; look at it again", rel)
+				}
+			default:
+				cur, err := loc.ReadFile()
 				if err != nil {
 					return "", cleanErr(err, rel)
 				}
@@ -931,32 +986,14 @@ func (t *DeleteFile) Prepare(_ context.Context, args Args) (*Action, error) {
 					return "", fmt.Errorf("%s changed on disk while waiting for approval; look at it again", rel)
 				}
 			}
-			var files, dirs []string
-			if st.IsDir() {
-				filepath.WalkDir(path, func(p string, d fs.DirEntry, werr error) error {
-					if werr != nil || d == nil {
-						return nil
-					}
-					if d.IsDir() {
-						dirs = append(dirs, p)
-					} else {
-						files = append(files, p)
-					}
-					return nil
-				})
+			files := walkFiles(loc)
+			if kind == "directory" {
+				err = loc.RemoveAll()
 			} else {
-				files = []string{path}
+				err = loc.Remove()
 			}
-			for _, f := range files {
-				if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
-					return "", cleanErr(err, rel)
-				}
-			}
-			sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
-			for _, d := range dirs {
-				if err := os.Remove(d); err != nil && !errors.Is(err, fs.ErrNotExist) {
-					return "", cleanErr(err, rel)
-				}
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return "", cleanErr(err, rel)
 			}
 			t.WS.unmark(files...)
 			return fmt.Sprintf("Deleted %s.", rel), nil

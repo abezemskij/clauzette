@@ -44,8 +44,9 @@ func (r Risk) String() string {
 // safe mode the agent copies these to the backup directory before the
 // action runs; if the backup fails, the action does not.
 type BackupRef struct {
-	Abs string // absolute path of the file or directory
-	Rel string // path relative to the workspace root, for naming and display
+	Abs string // absolute path of the file or directory, for display
+	Rel string // name inside the backup (see Loc.BackupRel)
+	Loc Loc    // where it is; the backup copies through this handle
 }
 
 // Action is a validated, ready-to-run tool invocation. Summary and Preview

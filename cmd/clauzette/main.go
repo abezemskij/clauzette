@@ -62,17 +62,31 @@ func run(cfgFlag string, resume bool, sessionID string, list, printCfg bool) err
 		fmt.Println(string(b))
 		return nil
 	}
-	store, err := session.NewStore(cfg.SessionsDir)
+	store, err := session.NewStore(cfg.AgentSessionsDir())
 	if err != nil {
 		return fmt.Errorf("sessions directory: %w", err)
+	}
+	if cfg.AgentDir {
+		store.Fallback = cfg.SessionsDir // sessions saved before per-agent directories
 	}
 	if list {
 		return listSessions(store)
 	}
-	ws, err := tools.NewWorkspace(cfg.Workspace)
+	wsOpt := tools.WorkspaceOptions{Share: cfg.Workspace}
+	if cfg.AgentDir {
+		wsOpt.AgentDir = cfg.AgentID
+		if wsOpt.Shared, err = tools.ParseAccess(cfg.SharedAccess); err != nil {
+			return err
+		}
+	}
+	ws, err := tools.OpenWorkspace(wsOpt)
 	if err != nil {
+		if cfg.AgentDir {
+			return fmt.Errorf("%w (agent_id %q, from the config, $CLAUZETTE_AGENT_ID or the hostname)", err, cfg.AgentID)
+		}
 		return err
 	}
+	defer ws.Close()
 	reg := buildRegistry(cfg, ws)
 	client := ollama.New(cfg.OllamaURL, ollama.Timeouts{
 		Connect:    secs(cfg.Timeouts.ConnectSeconds),
@@ -91,33 +105,58 @@ func run(cfgFlag string, resume bool, sessionID string, list, printCfg bool) err
 	if err != nil {
 		notes = append(notes, fmt.Sprintf("audit log disabled: %v", err))
 		audit = nil
+	} else if cfg.AgentDir {
+		audit.Agent = cfg.AgentID
 	}
 	defer audit.Close()
 
 	deps := agent.Deps{Cfg: cfg, Client: client, Registry: reg, Store: store, Guard: guard, Audit: audit, WS: ws}
-	buildPrompt := func(date string) (string, []string, error) {
-		return agent.BuildSystemPrompt(cfg, agent.PromptData{
-			Date:      date,
-			Workspace: ws.Root,
-			Model:     cfg.Model,
-			Shell:     cfg.Tools.Shell,
-			Tools:     reg.Names(),
-			Internet:  cfg.Prompt.InternetAccess,
-			NumCtx:    cfg.NumCtx,
-		})
+	// buildPrompts assembles both system prompts, the normal one and the
+	// one for rogue mode, so a session can switch without rebuilding.
+	buildPrompts := func(date string) (string, string, []string, error) {
+		data := agent.PromptData{
+			Date:         date,
+			Workspace:    ws.Root,
+			Share:        shareFor(ws),
+			SharedAccess: ws.Access.String(),
+			Model:        cfg.Model,
+			Shell:        cfg.Tools.Shell,
+			Tools:        reg.Names(),
+			Internet:     cfg.Prompt.InternetAccess,
+			NumCtx:       cfg.NumCtx,
+		}
+		sys, notes, err := agent.BuildSystemPrompt(cfg, data)
+		if err != nil {
+			return "", "", nil, err
+		}
+		data.Rogue = true
+		rogue, rogueNotes, err := agent.BuildSystemPrompt(cfg, data)
+		if err != nil {
+			return "", "", nil, err
+		}
+		seen := map[string]bool{}
+		for _, n := range notes {
+			seen[n] = true
+		}
+		for _, n := range rogueNotes {
+			if !seen[n] {
+				notes = append(notes, "rogue mode: "+n)
+			}
+		}
+		return sys, rogue, notes, nil
 	}
 	newSession := func() (*session.Session, []string, error) {
 		// The date is fixed when the session starts: a value that changes
 		// inside the system prompt would defeat Ollama's prompt cache.
 		date := time.Now().Format("Monday, 2 January 2006")
-		sys, n, err := buildPrompt(date)
+		sys, rogue, n, err := buildPrompts(date)
 		if err != nil {
 			return nil, nil, err
 		}
 		now := time.Now()
 		s := &session.Session{
 			ID: session.NewID(), Created: now, Updated: now,
-			Model: cfg.Model, Date: date, System: sys,
+			Model: cfg.Model, Date: date, System: sys, SystemRogue: rogue,
 			Think: cfg.Think, ShowThinking: cfg.ShowThinking,
 		}
 		return s, n, store.Save(s)
@@ -145,13 +184,22 @@ func run(cfgFlag string, resume bool, sessionID string, list, printCfg bool) err
 	}
 
 	u := ui.New(ui.Options{
-		Deps:        deps,
-		NewSession:  newSession,
-		BuildPrompt: buildPrompt,
-		Notes:       notes,
-		Resumed:     resumed,
+		Deps:         deps,
+		NewSession:   newSession,
+		BuildPrompts: buildPrompts,
+		Notes:        notes,
+		Resumed:      resumed,
 	}, sess)
 	return u.Run(ctx)
+}
+
+// shareFor is the shared workspace root for the prompt, "" when the agent
+// works in the whole workspace.
+func shareFor(ws *tools.Workspace) string {
+	if ws.HasAgentDir() {
+		return ws.Share
+	}
+	return ""
 }
 
 func buildRegistry(cfg *config.Config, ws *tools.Workspace) *tools.Registry {

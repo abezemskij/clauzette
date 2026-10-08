@@ -48,15 +48,25 @@ func (a *Agent) ModelContext() int { return a.Client.ModelNativeContext() }
 
 // ContextTokens estimates the size of the next request.
 func (a *Agent) ContextTokens() int {
-	chars := a.fixedChars
+	chars := a.fixed()
 	for _, m := range a.buildMessages()[1:] {
 		chars += msgChars(m)
 	}
 	return a.tokens(chars)
 }
 
+// entriesChars is the size of the messages alone, without the system
+// prompt and tool definitions.
+func (a *Agent) entriesChars(entries []session.Entry) int {
+	n := 0
+	for _, e := range entries {
+		n += msgChars(e.Message)
+	}
+	return n
+}
+
 func (a *Agent) entriesTokens(entries []session.Entry) int {
-	chars := a.fixedChars
+	chars := a.fixed()
 	for _, e := range entries {
 		chars += msgChars(e.Message)
 	}
@@ -67,7 +77,7 @@ func (a *Agent) calibrate(sent []ollama.Message, res *ollama.Result) {
 	if res == nil || res.PromptEvalCount <= 0 || len(sent) == 0 {
 		return
 	}
-	chars := a.fixedChars
+	chars := a.fixed()
 	for _, m := range sent[1:] {
 		chars += msgChars(m)
 	}
@@ -104,7 +114,31 @@ func (a *Agent) ensureRoom(ctx context.Context) error {
 	default:
 		return nil
 	}
-	return a.Compact(ctx)
+	return a.Compact(ctx, 0)
+}
+
+// compactLimits returns how much of the conversation compaction keeps
+// verbatim (in message tokens) and the size stage 1 alone must reach to
+// avoid a summary (whole context). ratio overrides
+// context.keep_recent_ratio for one compaction (/compact <percent>); 0 uses
+// the config.
+//
+// With a ratio, the newest share stays verbatim, and the older part is
+// summarised unless removing old tool output already halves it. Without
+// one, keep_recent_tokens and compact_target_tokens apply as they are.
+func (a *Agent) compactLimits(ratio float64) (keep, target int) {
+	cc := a.Cfg.Context
+	if ratio <= 0 {
+		ratio = cc.KeepRecentRatio
+	}
+	if ratio <= 0 {
+		return cc.KeepRecentTokens, cc.CompactTargetTokens
+	}
+	total := a.ContextTokens()
+	msgTokens := total - a.tokens(a.fixed())
+	keep = int(float64(msgTokens) * ratio)
+	older := msgTokens - keep
+	return keep, total - older/2
 }
 
 const summaryPreamble = "[Summary of the earlier part of this conversation, written automatically when the context was compacted. The original messages are no longer available to you.]\n\n"
@@ -131,15 +165,17 @@ Use at most about 1500 words. Write only the summary.`
 // Stage 1 removes old tool output and large tool-call arguments (file
 // contents) outside the recent part; the model can always re-read a file.
 // If that is not enough, stage 2 replaces the older part with a summary
-// written by the model (thinking off). The last keep_recent_tokens of the
-// conversation always stay verbatim. The full transcript is not touched.
-func (a *Agent) Compact(ctx context.Context) error {
+// written by the model (thinking off). The recent part (see compactLimits)
+// always stays verbatim. The full transcript is not touched. ratio > 0
+// keeps that share of the conversation for this compaction only.
+func (a *Agent) Compact(ctx context.Context, ratio float64) error {
 	cc := a.Cfg.Context
 	before := a.ContextTokens()
+	keep, target := a.compactLimits(ratio)
 	msgs := a.sess.Context
-	split := a.findSplit(msgs, cc.KeepRecentTokens)
+	split := a.findSplit(msgs, keep)
 	if split <= 0 {
-		return errors.New("nothing to compact yet: all messages are within the recent part that is always kept (context.keep_recent_tokens)")
+		return errors.New("nothing to compact yet: all messages are within the recent part that is always kept")
 	}
 	older := elide(msgs[:split], cc.ElideToolResultsOver)
 	recent := msgs[split:]
@@ -147,7 +183,7 @@ func (a *Agent) Compact(ctx context.Context) error {
 	candidate := make([]session.Entry, 0, len(msgs))
 	candidate = append(candidate, older...)
 	candidate = append(candidate, recent...)
-	if a.entriesTokens(candidate) <= cc.CompactTargetTokens {
+	if a.entriesTokens(candidate) <= target {
 		a.sess.Context = candidate
 		a.sess.Compactions++
 		a.sess.Note("context compacted: old tool output removed")
@@ -182,7 +218,10 @@ func (a *Agent) Compact(ctx context.Context) error {
 	a.sess.Note(fmt.Sprintf("context compacted: %d older messages replaced by a summary", split))
 	after := a.ContextTokens()
 	a.info("compacted ~%s → ~%s tokens (%d older messages summarized)", textutil.KTok(before), textutil.KTok(after), split)
-	if after > cc.CompactTargetTokens {
+	switch {
+	case after >= cc.CompactAtTokens:
+		a.warnf("the context is still at or above context.compact_at_tokens, so compaction will run again; keep less of it verbatim (context.keep_recent_ratio or keep_recent_tokens)")
+	case ratio <= 0 && cc.KeepRecentRatio <= 0 && after > cc.CompactTargetTokens:
 		a.warnf("the context is still above context.compact_target_tokens; consider lowering context.keep_recent_tokens")
 	}
 	a.Save()
@@ -368,14 +407,30 @@ func (a *Agent) ContextReport() string {
 			fmt.Fprintf(&sb, "  model supports up to %s tokens (fully used)\n", textutil.KTok(n))
 		}
 	}
-	fmt.Fprintf(&sb, "  system prompt + tool definitions  ~%s\n", textutil.KTok(a.tokens(a.fixedChars)))
+	fmt.Fprintf(&sb, "  system prompt + tool definitions  ~%s\n", textutil.KTok(a.tokens(a.fixed())))
 	for _, role := range []string{"user", "assistant", "tool"} {
 		if s := stats[role]; s != nil {
 			fmt.Fprintf(&sb, "  %-9s %4d message(s)          ~%s\n", role, s.n, textutil.KTok(a.tokens(s.chars)))
 		}
 	}
-	fmt.Fprintf(&sb, "Compaction at ~%s, down to ~%s, keeping the last ~%s verbatim. Compactions so far: %d.\n",
-		textutil.KTok(cc.CompactAtTokens), textutil.KTok(cc.CompactTargetTokens), textutil.KTok(cc.KeepRecentTokens), a.sess.Compactions)
+	if r := cc.KeepRecentRatio; r > 0 {
+		fmt.Fprintf(&sb, "Compaction at ~%s keeps the newest %.0f%% of the conversation verbatim; the older part loses old tool output and is summarised unless that halves it. Compactions so far: %d.\n",
+			textutil.KTok(cc.CompactAtTokens), r*100, a.sess.Compactions)
+	} else {
+		fmt.Fprintf(&sb, "Compaction at ~%s, down to ~%s, keeping the last ~%s verbatim. Compactions so far: %d.\n",
+			textutil.KTok(cc.CompactAtTokens), textutil.KTok(cc.CompactTargetTokens), textutil.KTok(cc.KeepRecentTokens), a.sess.Compactions)
+	}
+	if keep, _ := a.compactLimits(0); len(a.sess.Context) > 0 {
+		split := a.findSplit(a.sess.Context, keep)
+		if split <= 0 {
+			sb.WriteString("Compacting now would change nothing: everything is in the recent part.\n")
+		} else {
+			older := a.tokens(a.entriesChars(a.sess.Context[:split]))
+			recent := a.tokens(a.entriesChars(a.sess.Context[split:]))
+			fmt.Fprintf(&sb, "Compacting now would keep the newest %d of %d messages verbatim (~%s) and shrink or summarise the older %d (~%s); /compact <percent> summarises a different share once.\n",
+				len(a.sess.Context)-split, len(a.sess.Context), textutil.KTok(recent), split, textutil.KTok(older))
+		}
+	}
 	fmt.Fprintf(&sb, "Last request: prompt_eval_count=%d, eval_count=%d. Estimates use %.2f characters per token.\n",
 		a.sess.LastPromptTokens, a.sess.LastEvalTokens, a.cpt)
 	fmt.Fprintf(&sb, "Full transcript: %d entries (kept in the session file, never compacted).", len(a.sess.Transcript))

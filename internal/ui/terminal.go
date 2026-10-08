@@ -19,14 +19,16 @@ import (
 	"clauzette/internal/agent"
 	"clauzette/internal/session"
 	"clauzette/internal/textutil"
+	"clauzette/internal/tools"
 )
 
 type Options struct {
-	Deps        agent.Deps
-	NewSession  func() (*session.Session, []string, error)
-	BuildPrompt func(date string) (string, []string, error)
-	Notes       []string
-	Resumed     bool
+	Deps       agent.Deps
+	NewSession func() (*session.Session, []string, error)
+	// BuildPrompts assembles the normal and the rogue-mode system prompt.
+	BuildPrompts func(date string) (normal, rogue string, notes []string, err error)
+	Notes        []string
+	Resumed      bool
 }
 
 type inputLine struct {
@@ -216,6 +218,12 @@ func (u *UI) handleInput(in inputLine) bool {
 		return false
 	}
 	if !in.literal && strings.HasPrefix(trimmed, "/") {
+		// /rogue off is the one slash command that works mid-task: it is
+		// how the operator takes back control without cancelling.
+		if u.busy && strings.EqualFold(strings.Join(strings.Fields(trimmed), " "), "/rogue off") {
+			u.rogue([]string{"off"})
+			return false
+		}
 		if u.busy {
 			u.warnf("/ commands work while the agent is idle; use ! commands while it works (!help)")
 			return false
@@ -322,11 +330,15 @@ func (u *UI) control(cmd string) bool {
 			u.warnf("usage: !plan [on|off]")
 			return false
 		}
+		wasRogue := u.agent.Rogue()
 		if u.agent.SetPlan(v) && !u.busy {
 			u.agent.Save()
 		}
+		if wasRogue && !u.agent.Rogue() {
+			u.warnf("rogue mode switched off: it cannot be combined with plan mode")
+		}
 		if v {
-			u.infof("plan mode on: write/exec/destructive actions are captured, not executed; /plan lists them, /plan approve [n|all] runs them")
+			u.infof("plan mode on: write/exec/destructive actions are captured, not executed; /plan lists them, /plan approve [n|all] [comment] runs them")
 		} else {
 			u.infof("plan mode off: actions run as usual (with approval); %d pending action%s stay in the list", u.agent.PlanPending(), plural(u.agent.PlanPending()))
 		}
@@ -359,7 +371,17 @@ func (u *UI) slash(cmd string) bool {
 	case "/context":
 		u.block(u.agent.ContextReport())
 	case "/compact":
-		u.runBusy("compact", func(ctx context.Context) error { return u.agent.Compact(ctx) })
+		// /compact <percent> summarises that share of the oldest conversation once
+		ratio := 0.0
+		if len(args) > 0 {
+			p, err := strconv.Atoi(strings.TrimSuffix(args[0], "%"))
+			if err != nil || p < 10 || p > 90 || len(args) > 1 {
+				u.warnf("usage: /compact [percent]  (10-90: the share of the oldest conversation to summarise)")
+				return false
+			}
+			ratio = 1 - float64(p)/100
+		}
+		u.runBusy("compact", func(ctx context.Context) error { return u.agent.Compact(ctx, ratio) })
 	case "/sessions":
 		u.listSessions()
 	case "/new":
@@ -397,21 +419,34 @@ func (u *UI) slash(cmd string) bool {
 		u.infof("resending: %s", textutil.OneLine(text, 80))
 		u.startTurn(text)
 	case "/system":
+		u.warnf("/system is now /system-prompt [reload]")
+	case "/system-prompt":
 		if len(args) > 0 && strings.EqualFold(args[0], "reload") {
 			s := u.agent.Session()
-			sys, notes, err := u.opt.BuildPrompt(s.Date)
+			sys, rogue, notes, err := u.opt.BuildPrompts(s.Date)
 			if err != nil {
 				u.errorf("%v", err)
 				return false
 			}
-			u.agent.SetSystem(sys)
+			u.agent.SetSystems(sys, rogue)
 			u.agent.Save()
 			for _, n := range notes {
 				u.infof("%s", n)
 			}
-			u.infof("system prompt rebuilt (%d characters); the next request re-reads the whole conversation", len(sys))
+			u.infof("system prompts rebuilt (normal %d, rogue mode %d characters); the next request re-reads the whole conversation", len(sys), len(rogue))
 		} else {
-			u.block(u.agent.Session().System)
+			s := u.agent.Session()
+			if u.agent.Rogue() {
+				u.infof("the system prompt for rogue mode (in use now):")
+				if s.SystemRogue != "" {
+					u.block(s.SystemRogue)
+				} else {
+					u.block(s.System)
+				}
+			} else {
+				u.infof("the system prompt (rogue mode uses its own; /rogue on, then /system-prompt shows it):")
+				u.block(s.System)
+			}
 		}
 	case "/gpu":
 		u.block(u.opt.Deps.Guard.Report())
@@ -426,8 +461,9 @@ func (u *UI) slash(cmd string) bool {
 		}
 	case "/safe":
 		if len(args) > 0 && strings.EqualFold(args[0], "restore") {
-			if len(args) != 2 {
-				u.warnf("usage: /safe restore <number> (see /safe)")
+			force := len(args) == 3 && strings.EqualFold(args[2], "force")
+			if len(args) != 2 && !force {
+				u.warnf("usage: /safe restore <number> [force] (see /safe)")
 				return false
 			}
 			n, err := strconv.Atoi(args[1])
@@ -435,7 +471,7 @@ func (u *UI) slash(cmd string) bool {
 				u.warnf("the backup number must be a positive integer")
 				return false
 			}
-			out, err := u.agent.RestoreBackup(n)
+			out, err := u.agent.RestoreBackup(n, force)
 			if err != nil {
 				u.errorf("%v", err)
 				return false
@@ -444,53 +480,33 @@ func (u *UI) slash(cmd string) bool {
 			return false
 		}
 		u.block(u.agent.SafeReport())
+	case "/rogue":
+		u.rogue(args)
 	case "/plan":
-		if len(args) > 0 && strings.EqualFold(args[0], "approve") {
-			nums, err := parsePlanNumbers(args[1:], u.agent.PlanPending())
+		if len(args) > 0 && (strings.EqualFold(args[0], "approve") || strings.EqualFold(args[0], "reject")) {
+			approve := strings.EqualFold(args[0], "approve")
+			// the comment is taken from the raw line, so its spacing is kept
+			_, rest := nextField(cmd)
+			_, rest = nextField(rest)
+			p, err := parsePlanArgs(rest, u.agent.PlanPending(), approve)
 			if err != nil {
 				u.warnf("%v", err)
 				return false
 			}
 			u.runBusy("plan", func(ctx context.Context) error {
-				report, cont, err := u.agent.PlanApprove(ctx, nums)
+				var report, cont string
+				var err error
+				if approve {
+					report, cont, err = u.agent.PlanApprove(ctx, p.nums, agent.PlanApproveOptions{Comment: p.comment, NoContinue: p.noContinue})
+				} else {
+					report, cont, err = u.agent.PlanReject(p.nums, p.comment)
+				}
 				if err != nil {
 					return err
 				}
 				u.infof("%s", report)
 				if cont != "" {
-					return u.agent.RunTurn(ctx, cont)
-				}
-				return nil
-			})
-			return false
-		}
-		if len(args) > 0 && strings.EqualFold(args[0], "reject") {
-			nums, rest, err := splitPlanNumbers(args[1:])
-			if err != nil {
-				u.warnf("%v", err)
-				return false
-			}
-			// validate the numbers now, before the model turn is started
-			if nums != nil {
-				for _, n := range nums {
-					if n < 1 || n > u.agent.PlanPending() {
-						u.warnf("no pending action %d; this session has %d (see /plan)", n, u.agent.PlanPending())
-						return false
-					}
-				}
-			} else if u.agent.PlanPending() == 0 {
-				u.warnf("no pending actions; /plan shows the state")
-				return false
-			}
-			reason := strings.TrimSpace(rest)
-			u.runBusy("plan", func(ctx context.Context) error {
-				report, cont, err := u.agent.PlanReject(nums, reason)
-				if err != nil {
-					return err
-				}
-				u.infof("%s", report)
-				if cont != "" {
-					return u.agent.RunTurn(ctx, cont)
+					return u.agent.RunHarnessTurn(ctx, cont)
 				}
 				return nil
 			})
@@ -501,6 +517,84 @@ func (u *UI) slash(cmd string) bool {
 		u.warnf("unknown command %s; type /help", name)
 	}
 	return false
+}
+
+// rogue handles /rogue [on [steps]|off].
+func (u *UI) rogue(args []string) {
+	a := u.agent
+	if len(args) == 0 {
+		if !a.Rogue() {
+			u.infof("rogue mode is off. /rogue on [steps] runs every action without approval until the model finishes each task")
+			return
+		}
+		u.infof("rogue mode is on: %s", u.rogueLimits())
+		return
+	}
+	switch strings.ToLower(args[0]) {
+	case "on":
+		steps := 0
+		if len(args) > 2 {
+			u.warnf("usage: /rogue on [steps]")
+			return
+		}
+		if len(args) == 2 {
+			n, err := strconv.Atoi(args[1])
+			if err != nil || n < 1 {
+				u.warnf("the step budget must be a positive number")
+				return
+			}
+			steps = n
+		}
+		if !a.HasRogueSystem() {
+			// a session saved before rogue mode had its own system prompt
+			s := a.Session()
+			_, rogue, _, err := u.opt.BuildPrompts(s.Date)
+			if err != nil {
+				u.errorf("could not build the rogue-mode system prompt: %v", err)
+				return
+			}
+			a.SetSystems(s.System, rogue) // the normal prompt stays as it was frozen
+		}
+		if _, err := a.SetRogue(true, steps); err != nil {
+			u.warnf("%v", err)
+			return
+		}
+		a.Save()
+		var unattended []string
+		for _, n := range u.opt.Deps.Registry.Names() {
+			if t, ok := u.opt.Deps.Registry.Get(n); ok && t.Risk() != tools.ReadOnly {
+				unattended = append(unattended, n)
+			}
+		}
+		u.warnf("ROGUE MODE ON: %s now run without approval", strings.Join(unattended, ", "))
+		u.warnf("per message: %s; mv/delete are always backed up first (/safe restore)", u.rogueLimits())
+		if ws := u.opt.Deps.WS; ws != nil && ws.HasAgentDir() {
+			u.warnf("outside %s the file tools have %s access; exec_command is not confined", ws.Root, ws.Access)
+		}
+		u.warnf("stop the current task with !c, take back approvals with /rogue off (works mid-task)")
+		if !a.Think() {
+			u.infof("thinking is off; the rogue-mode prompt asks the model to think before acting (!think on)")
+		}
+	case "off":
+		if changed, _ := a.SetRogue(false, 0); !changed {
+			u.infof("rogue mode is already off")
+			return
+		}
+		if !u.busy {
+			a.Save()
+		}
+		u.infof("rogue mode off: actions need approval again from the next one")
+	default:
+		u.warnf("usage: /rogue [on [steps]|off]")
+	}
+}
+
+func (u *UI) rogueLimits() string {
+	s := fmt.Sprintf("up to %d steps", u.agent.RogueBudget())
+	if m := u.opt.Deps.Cfg.Rogue.MaxMinutes; m > 0 {
+		s += fmt.Sprintf(" and %d minutes", m)
+	}
+	return s + ", until the model calls finish"
 }
 
 func (u *UI) switchSession(s *session.Session, notes []string) {
@@ -852,7 +946,11 @@ func (u *UI) promptString() string {
 	if !u.warm {
 		parts = append(parts, "model loading")
 	}
-	return u.style(cDim, "["+strings.Join(parts, " · ")+"]") + " " + u.style(cBold, "› ")
+	mode := ""
+	if u.agent.Rogue() {
+		mode = u.style(cRed+cBold, "ROGUE") + " "
+	}
+	return mode + u.style(cDim, "["+strings.Join(parts, " · ")+"]") + " " + u.style(cBold, "› ")
 }
 
 func (u *UI) promptLine() {
@@ -870,7 +968,14 @@ func (u *UI) refreshPrompt() {
 func (u *UI) banner() {
 	cfg := u.opt.Deps.Cfg
 	s := u.agent.Session()
-	u.line(u.style(cBold, "Clauzette - Flush your thoughts.") + u.style(cDim, fmt.Sprintf(" · %s @ %s · workspace %s", cfg.Model, cfg.OllamaURL, cfg.Workspace)))
+	where := cfg.Workspace
+	if ws := u.opt.Deps.WS; ws != nil {
+		where = ws.Root
+		if ws.HasAgentDir() {
+			where = fmt.Sprintf("%s (shared %s: %s)", ws.Root, ws.Share, ws.Access)
+		}
+	}
+	u.line(u.style(cBold, "Clauzette - Flush your thoughts.") + u.style(cDim, fmt.Sprintf(" · %s @ %s · workspace %s", cfg.Model, cfg.OllamaURL, where)))
 	if u.opt.Resumed {
 		u.infof("resumed session %s: %d messages in context", s.ID, len(s.Context))
 		if s.Model != "" && s.Model != cfg.Model {
@@ -908,16 +1013,25 @@ func (u *UI) help() {
   !!text            send a message that starts with '!'
 While idle:
   /context          context usage and compaction settings
-  /compact          compact the context now
+  /compact [percent]  compact the context now; with a percent (10-90),
+                    summarise that share of the oldest conversation this once
   /undo  /retry     drop the last exchange (and resend it)
   /sessions  /new  /load <id>
-  /system [reload]  show or rebuild the system prompt
+  /system-prompt [reload]  show the system prompt in use, or rebuild both
+                    (normal and rogue mode)
   /gpu              GPU guard status
   /approvals [reset]
-  /safe [restore <n>]  safe mode status and backups, restore a backup
+  /safe [restore <n> [force]]  safe mode status and backups, restore a backup
+                    (force replaces what exists now, after backing it up)
+  /rogue [on [steps]|off]  rogue mode: no approvals, work until the model calls
+                    finish (budget: steps or agent.max_steps, rogue.max_minutes);
+                    /rogue off also works mid-task
   /plan             pending actions from plan mode
-  /plan approve [n ...|all]    run the pending actions in order
+  /plan approve [n ...|all] [--no-continue] [comment]
+                    run pending actions in order; the comment goes to the model
+                    with the results, --no-continue holds them for your next message
   /plan reject [n ...|all] [reason]  discard them and tell the model why
+                    (use -- before a comment or reason that starts with a number)
   /help  /exit
 Input:
   """ on its own line starts and ends a multi-line message.
@@ -939,43 +1053,66 @@ func parseToggle(arg string, current bool) (bool, bool) {
 	return false, false
 }
 
-// parsePlanNumbers turns "/plan approve" arguments into 1-based pending
-// numbers. Empty or "all" selects everything (nil).
-func parsePlanNumbers(args []string, total int) ([]int, error) {
-	if len(args) == 0 || len(args) == 1 && strings.EqualFold(args[0], "all") {
-		return nil, nil
-	}
-	var out []int
-	for _, s := range args {
-		n, err := strconv.Atoi(s)
-		if err != nil || n < 1 || n > total {
-			return nil, fmt.Errorf("invalid action number %q (1-%d, or \"all\")", s, total)
-		}
-		out = append(out, n)
-	}
-	return out, nil
+// planArgs is the parsed tail of "/plan approve" or "/plan reject".
+type planArgs struct {
+	nums       []int  // nil selects all
+	comment    string // the comment (approve) or reason (reject), as typed
+	noContinue bool
 }
 
-// splitPlanNumbers handles "/plan reject n ... [reason]": leading numbers
-// are the selection, the rest is the reason sent to the model.
-func splitPlanNumbers(args []string) ([]int, string, error) {
-	if len(args) == 0 || strings.EqualFold(args[0], "all") {
-		return nil, strings.TrimSpace(strings.Join(args[1:], " ")), nil
-	}
-	var nums []int
-	i := 0
-	for i < len(args) {
-		n, err := strconv.Atoi(args[i])
-		if err != nil {
-			break
+// parsePlanArgs parses "<n ...|all> [--no-continue] [--] [comment]", the
+// raw text after "/plan approve" or "/plan reject". The selection is the
+// leading numbers or "all"; the comment is everything after it, spacing
+// kept. "--" ends the selection, for a comment that starts with a number.
+// A bare command selects all; a comment without a selection is refused,
+// because "/plan approve looks good" may not mean all of them.
+func parsePlanArgs(rest string, total int, allowNoContinue bool) (planArgs, error) {
+	var p planArgs
+	all := false
+selection:
+	for {
+		tok, after := nextField(rest)
+		switch {
+		case tok == "":
+			break selection
+		case tok == "--":
+			rest = after
+			break selection
+		case allowNoContinue && tok == "--no-continue":
+			p.noContinue = true
+		case strings.EqualFold(tok, "all") && !all && len(p.nums) == 0:
+			all = true
+		default:
+			n, err := strconv.Atoi(tok)
+			if err != nil || all {
+				break selection
+			}
+			if n < 1 || n > total {
+				return p, fmt.Errorf("no pending action %d; this session has %d (see /plan)", n, total)
+			}
+			p.nums = append(p.nums, n)
 		}
-		nums = append(nums, n)
-		i++
+		rest = after
 	}
-	if len(nums) == 0 {
-		return nil, "", fmt.Errorf("invalid action number %q (1-N, or \"all\")", args[0])
+	p.comment = strings.TrimSpace(rest)
+	if total == 0 {
+		return p, errors.New("no pending actions; /plan shows the state")
 	}
-	return nums, strings.TrimSpace(strings.Join(args[i:], " ")), nil
+	if !all && len(p.nums) == 0 && p.comment != "" {
+		return p, fmt.Errorf("say which actions the comment goes with: /plan <approve|reject> all %s, or numbers from /plan (start a comment that begins with a number with --)",
+			textutil.OneLine(p.comment, 40))
+	}
+	return p, nil
+}
+
+// nextField splits off the first space-separated word of s and returns it
+// with the unchanged rest.
+func nextField(s string) (string, string) {
+	s = strings.TrimLeft(s, " \t")
+	if i := strings.IndexAny(s, " \t"); i >= 0 {
+		return s[:i], s[i:]
+	}
+	return s, ""
 }
 
 func onOff(v bool) string {

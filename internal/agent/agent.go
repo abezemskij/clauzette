@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,22 +37,32 @@ type Deps struct {
 // called at any time.
 type Agent struct {
 	Deps
-	sess       *session.Session
-	events     chan<- Event
-	think      atomic.Bool
-	show       atomic.Bool
-	safe       atomic.Bool
-	plan       atomic.Bool
-	pending    []*PendingAction // plan mode: prepared actions awaiting /plan approve
+	sess   *session.Session
+	events chan<- Event
+	think  atomic.Bool
+	show   atomic.Bool
+	safe   atomic.Bool
+	plan   atomic.Bool
+	rogue  atomic.Bool
+	// rogueSteps is the step budget per message set by /rogue on <n>; 0
+	// means agent.max_steps.
+	rogueSteps atomic.Int64
+	// mu guards the session fields the front end may touch while a turn
+	// runs (Pending, QueuedNotes) and serializes saving.
+	mu         sync.Mutex
 	specs      []ollama.ToolSpec
-	fixedChars int     // system prompt + tool definitions
-	cpt        float64 // estimated characters per token, calibrated from Ollama's counts
+	rogueSpecs []ollama.ToolSpec // specs plus finish
+	fixedChars int               // system prompt + tool definitions
+	rogueFixed int               // the same with rogueSpecs
+	rt         *rogueTurn        // the current turn in rogue mode, nil otherwise
+	cpt        float64           // estimated characters per token, calibrated from Ollama's counts
 	always     map[string]bool
 }
 
 func New(d Deps, sess *session.Session, events chan<- Event) *Agent {
 	a := &Agent{Deps: d, sess: sess, events: events, cpt: 3.5, always: map[string]bool{}}
 	a.specs = d.Registry.Specs()
+	a.rogueSpecs = append(append([]ollama.ToolSpec(nil), a.specs...), finishSpec())
 	a.recomputeFixed()
 	a.think.Store(sess.Think)
 	a.show.Store(sess.ShowThinking)
@@ -69,21 +80,45 @@ func New(d Deps, sess *session.Session, events chan<- Event) *Agent {
 func (a *Agent) recomputeFixed() {
 	specJSON, _ := json.Marshal(a.specs)
 	a.fixedChars = len(a.sess.System) + len(specJSON) + 64
+	rogueJSON, _ := json.Marshal(a.rogueSpecs)
+	a.rogueFixed = len(a.rogueSystem()) + len(rogueJSON) + 64
 }
 
 func (a *Agent) Session() *session.Session { return a.sess }
-func (a *Agent) Think() bool                { return a.think.Load() }
-func (a *Agent) SetThink(v bool)            { a.think.Store(v) }
-func (a *Agent) Show() bool                 { return a.show.Load() }
-func (a *Agent) SetShow(v bool)             { a.show.Store(v) }
-func (a *Agent) Safe() bool                 { return a.safe.Load() }
-func (a *Agent) SetSafe(v bool)             { a.safe.Store(v) }
-func (a *Agent) Plan() bool                 { return a.plan.Load() }
+func (a *Agent) Think() bool               { return a.think.Load() }
+func (a *Agent) SetThink(v bool)           { a.think.Store(v) }
+func (a *Agent) Show() bool                { return a.show.Load() }
+func (a *Agent) SetShow(v bool)            { a.show.Store(v) }
+func (a *Agent) Safe() bool                { return a.safe.Load() }
+func (a *Agent) SetSafe(v bool)            { a.safe.Store(v) }
+func (a *Agent) Plan() bool                { return a.plan.Load() }
 
-// SetSystem replaces the session's system prompt (used by /system reload).
-func (a *Agent) SetSystem(s string) {
-	a.sess.System = s
+// SetSystems replaces the session's system prompts, the normal one and
+// the one for rogue mode (used by /system-prompt reload, and by /rogue on
+// for sessions saved before rogue mode had its own prompt).
+func (a *Agent) SetSystems(normal, rogue string) {
+	a.sess.System, a.sess.SystemRogue = normal, rogue
 	a.recomputeFixed()
+}
+
+// HasRogueSystem reports whether the session has a system prompt for rogue mode.
+func (a *Agent) HasRogueSystem() bool { return a.sess.SystemRogue != "" }
+
+// system is the system prompt for the next request.
+func (a *Agent) system() string {
+	if a.rogue.Load() {
+		return a.rogueSystem()
+	}
+	return a.sess.System
+}
+
+// rogueSystem is the rogue-mode system prompt, or the normal one in a
+// session that has none.
+func (a *Agent) rogueSystem() string {
+	if a.sess.SystemRogue != "" {
+		return a.sess.SystemRogue
+	}
+	return a.sess.System
 }
 
 // AutoApproved lists tools that currently run without asking.
@@ -122,9 +157,13 @@ func (a *Agent) autoApproved(name string) bool {
 	return false
 }
 
-func (a *Agent) emit(e Event)                     { a.events <- e }
-func (a *Agent) info(format string, args ...any)  { a.emit(Event{Kind: EvInfo, Text: fmt.Sprintf(format, args...)}) }
-func (a *Agent) warnf(format string, args ...any) { a.emit(Event{Kind: EvWarn, Text: fmt.Sprintf(format, args...)}) }
+func (a *Agent) emit(e Event) { a.events <- e }
+func (a *Agent) info(format string, args ...any) {
+	a.emit(Event{Kind: EvInfo, Text: fmt.Sprintf(format, args...)})
+}
+func (a *Agent) warnf(format string, args ...any) {
+	a.emit(Event{Kind: EvWarn, Text: fmt.Sprintf(format, args...)})
+}
 
 // Save writes the session to disk. Called after every step, so a killed
 // pod or dropped connection loses at most the step in progress.
@@ -134,7 +173,10 @@ func (a *Agent) Save() {
 	a.sess.Safe = a.safe.Load()
 	a.sess.Plan = a.plan.Load()
 	a.sess.CharsPerToken = a.cpt
-	if err := a.Store.Save(a.sess); err != nil {
+	a.mu.Lock()
+	err := a.Store.Save(a.sess)
+	a.mu.Unlock()
+	if err != nil {
 		a.warnf("could not save the session: %v", err)
 	}
 }
@@ -158,7 +200,7 @@ func requestOptions(cfg *config.Config) map[string]any {
 // the model remembers why it called its tools.
 func (a *Agent) buildMessages() []ollama.Message {
 	msgs := make([]ollama.Message, 0, len(a.sess.Context)+1)
-	msgs = append(msgs, ollama.Message{Role: "system", Content: a.sess.System})
+	msgs = append(msgs, ollama.Message{Role: "system", Content: a.system()})
 	lastUser := -1
 	for i, e := range a.sess.Context {
 		if e.Role == "user" {
@@ -180,32 +222,78 @@ func (a *Agent) buildMessages() []ollama.Message {
 // Cancelling ctx (the operator typed !c) stops it at the next safe point
 // and leaves a valid history behind.
 func (a *Agent) RunTurn(ctx context.Context, text string) error {
+	return a.runTurn(ctx, text, "")
+}
+
+// RunHarnessTurn starts a turn with a harness message (kind
+// session.KindHarness) instead of an operator message, so /undo and /retry
+// do not mistake it for something the operator typed.
+func (a *Agent) RunHarnessTurn(ctx context.Context, text string) error {
+	return a.runTurn(ctx, text, session.KindHarness)
+}
+
+func (a *Agent) runTurn(ctx context.Context, text, kind string) error {
 	defer a.Save()
-	if a.sess.Title == "" {
+	if a.sess.Title == "" && kind == "" {
 		a.sess.Title = textutil.OneLine(text, 60)
 	}
-	a.sess.Append(ollama.Message{Role: "user", Content: text}, "")
+	a.flushNotes()
+	a.sess.Append(ollama.Message{Role: "user", Content: text}, kind)
 	a.Save()
+	rt := a.startRogueTurn()
+	defer func() { a.rt = nil }()
+
+	// In rogue mode the work runs under the time limit: sctx ends at the
+	// deadline, which stops whatever is in progress (a model reply, thinking
+	// included, a command, a GPU pause). ctx stays the operator's.
+	sctx := ctx
+	if rt != nil && !rt.deadline.IsZero() {
+		var cancel context.CancelFunc
+		sctx, cancel = context.WithDeadline(ctx, rt.deadline)
+		defer cancel()
+	}
+	timedOut := func() bool { return rt != nil && sctx.Err() != nil && ctx.Err() == nil }
 
 	for step := 1; ; step++ {
-		if limit := a.Cfg.Agent.MaxSteps; limit > 0 && step > limit {
+		if step > 1 {
+			a.flushNotes()
+		}
+		if rt != nil && !a.rogue.Load() {
+			// /rogue off during the turn: approvals, agent.max_steps and no time limit from here
+			rt, a.rt, sctx = nil, nil, ctx
+		}
+		if rt != nil {
+			if reason := rt.finalReason(step); reason != "" {
+				return a.rogueFinal(ctx, reason)
+			}
+		} else if limit := a.Cfg.Agent.MaxSteps; limit > 0 && step > limit {
 			a.warnf("stopped after %d model calls without a final answer (agent.max_steps); send a message to let it continue", limit)
 			a.sess.Append(ollama.Message{Role: "assistant", Content: "[Stopped by the harness: step limit reached before a final answer.]"}, session.KindInterrupted)
 			return nil
 		}
-		if err := a.Guard.Wait(ctx, func(s string) { a.info("%s", s) }); err != nil {
+		if err := a.Guard.Wait(sctx, func(s string) { a.info("%s", s) }); err != nil {
+			if timedOut() {
+				return a.rogueFinal(ctx, rogueTimeLimit)
+			}
 			a.markInterrupted(nil, "")
 			return err
 		}
-		if err := a.ensureRoom(ctx); err != nil {
+		if err := a.ensureRoom(sctx); err != nil {
+			if timedOut() {
+				return a.rogueFinal(ctx, rogueTimeLimit)
+			}
 			if ctx.Err() != nil {
 				a.markInterrupted(nil, "")
 				return ctx.Err()
 			}
 			return err
 		}
-		res, err := a.callModel(ctx)
+		res, err := a.callModel(sctx, a.think.Load())
 		if err != nil {
+			if timedOut() {
+				a.markInterrupted(res, "[Stopped by the harness: rogue mode's time limit was reached.]")
+				return a.rogueFinal(ctx, rogueTimeLimit)
+			}
 			if ctx.Err() != nil {
 				a.markInterrupted(res, "")
 				return ctx.Err()
@@ -220,6 +308,12 @@ func (a *Agent) RunTurn(ctx context.Context, text string) error {
 		a.Save()
 
 		if len(res.Message.ToolCalls) == 0 {
+			if rt != nil && !rt.nudged {
+				rt.nudged = true
+				a.appendHarness(rt.nudge(step))
+				a.info("rogue: the model replied without acting or calling finish; nudging it once to continue")
+				continue
+			}
 			if strings.TrimSpace(res.Message.Content) == "" {
 				a.warnf("the model returned an empty reply")
 			}
@@ -230,12 +324,26 @@ func (a *Agent) RunTurn(ctx context.Context, text string) error {
 				a.cancelRemaining(res.Message.ToolCalls[i:])
 				return ctx.Err()
 			}
-			out := a.runTool(ctx, call)
+			if timedOut() {
+				a.skipCalls(res.Message.ToolCalls[i:], "Not run: rogue mode's time limit was reached.")
+				return a.rogueFinal(ctx, rogueTimeLimit)
+			}
+			out := a.runTool(sctx, call)
+			if rt != nil && !rt.finished {
+				out += rt.reminder(step)
+			}
 			a.sess.Append(ollama.Message{Role: "tool", ToolName: call.Function.Name, Content: out}, "")
 			a.Save()
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if rt != nil && rt.finished {
+			a.info("rogue: the model finished the task: %s", rt.summary)
+			return nil
+		}
+		if timedOut() {
+			return a.rogueFinal(ctx, rogueTimeLimit)
 		}
 	}
 }
@@ -262,18 +370,22 @@ func (a *Agent) markInterrupted(res *ollama.Result, note string) {
 // a tool call without a result confuses most models (and some templates
 // reject it).
 func (a *Agent) cancelRemaining(calls []ollama.ToolCall) {
+	a.skipCalls(calls, "Cancelled by the operator before it ran.")
+}
+
+// skipCalls gives each tool call that will not run a result saying why.
+func (a *Agent) skipCalls(calls []ollama.ToolCall, why string) {
 	for _, c := range calls {
-		a.sess.Append(ollama.Message{Role: "tool", ToolName: c.Function.Name, Content: "Cancelled by the operator before it ran."}, session.KindCancelled)
+		a.sess.Append(ollama.Message{Role: "tool", ToolName: c.Function.Name, Content: why}, session.KindCancelled)
 	}
 }
 
-func (a *Agent) callModel(ctx context.Context) (*ollama.Result, error) {
+func (a *Agent) callModel(ctx context.Context, think bool) (*ollama.Result, error) {
 	msgs := a.buildMessages()
-	think := a.think.Load()
 	req := ollama.ChatRequest{
 		Model:     a.Cfg.Model,
 		Messages:  msgs,
-		Tools:     a.specs,
+		Tools:     a.toolSpecs(),
 		Think:     &think,
 		Options:   requestOptions(a.Cfg),
 		KeepAlive: a.Cfg.KeepAlive,
@@ -321,6 +433,10 @@ func (a *Agent) runTool(ctx context.Context, call ollama.ToolCall) string {
 		return out
 	}
 
+	if name == finishTool && a.rt != nil {
+		rec["decision"] = "rogue"
+		return finish(a.runFinish(args))
+	}
 	t, ok := a.Registry.Get(name)
 	if !ok {
 		return finish(fmt.Sprintf("Error: there is no tool named %q. Available tools: %s.",
@@ -333,9 +449,12 @@ func (a *Agent) runTool(ctx context.Context, call ollama.ToolCall) string {
 	rec["summary"] = action.Summary
 
 	if a.plan.Load() && t.Risk() != tools.ReadOnly {
-		a.pending = append(a.pending, &PendingAction{Name: name, Action: action})
+		a.mu.Lock()
+		a.sess.Pending = append(a.sess.Pending, &session.PendingCall{Name: name, Args: copyArgs(args), Summary: action.Summary})
+		n := len(a.sess.Pending)
+		a.mu.Unlock()
 		rec["decision"] = "planned"
-		out := fmt.Sprintf("Planned, not executed (pending action %d): %s", len(a.pending), action.Summary)
+		out := fmt.Sprintf("Planned, not executed (pending action %d): %s", n, action.Summary)
 		out += " Plan mode is on: the operator reviews the list with /plan and runs it with /plan approve."
 		out += " Keep reading and refining the plan; do not try to reach the same result through another tool."
 		return finish(out, false)
@@ -350,10 +469,14 @@ func (a *Agent) runTool(ctx context.Context, call ollama.ToolCall) string {
 // was an error or denial. runTool uses it for live actions, and /plan
 // approve uses it for planned ones, so both paths behave identically.
 func (a *Agent) executeAction(ctx context.Context, name string, t tools.Tool, action *tools.Action, rec map[string]any) (string, bool) {
+	rogue := a.rogue.Load()
 	auto := t.Risk() == tools.ReadOnly || (a.autoApproved(name) && !(a.safe.Load() && t.Risk() == tools.Destructive))
-	if auto {
+	switch {
+	case auto:
 		rec["decision"] = "auto"
-	} else {
+	case rogue:
+		rec["decision"] = "rogue"
+	default:
 		reply := make(chan Decision, 1)
 		summ := action.Summary
 		if a.safe.Load() {
@@ -392,7 +515,8 @@ func (a *Agent) executeAction(ctx context.Context, name string, t tools.Tool, ac
 		}
 	}
 
-	if a.safe.Load() && len(action.Backups) > 0 {
+	// Rogue mode always backs up: nobody reviews a move or delete there.
+	if (a.safe.Load() || rogue) && len(action.Backups) > 0 {
 		dest, err := a.backupTargets(name, action.Backups)
 		if err != nil {
 			return fmt.Sprintf("Error: safe mode could not make a backup before %s, so it was not run: %v", name, err), true
@@ -476,6 +600,16 @@ func summarizeArgs(m map[string]any) string {
 		parts = append(parts, k+"="+v)
 	}
 	return strings.Join(parts, " ")
+}
+
+// copyArgs makes a shallow copy of tool arguments, so a planned call does
+// not share its map with the message history.
+func copyArgs(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // auditArgs copies the arguments, shortening long strings (file contents).

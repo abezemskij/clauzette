@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -24,8 +25,16 @@ type Config struct {
 
 	Workspace   string `json:"workspace"`
 	SessionsDir string `json:"sessions_dir"`
-	AuditLog    string `json:"audit_log"`
-	Color       string `json:"color"` // auto | always | never
+
+	// A shared workspace for several agents: with agent_dir, the agent works
+	// in <workspace>/<agent_id>, and its sessions and backups live in
+	// <sessions_dir>/<agent_id>.
+	AgentID      string `json:"agent_id"`      // "" = $CLAUZETTE_AGENT_ID, then the hostname (the pod name in Kubernetes)
+	AgentDir     bool   `json:"agent_dir"`     // work in <workspace>/<agent_id> instead of the whole workspace
+	SharedAccess string `json:"shared_access"` // none | read | write: what the agent may do in the workspace outside its directory
+
+	AuditLog string `json:"audit_log"`
+	Color    string `json:"color"` // auto | always | never
 
 	Prompt   PromptConfig  `json:"prompt"`
 	Context  ContextConfig `json:"context"`
@@ -33,11 +42,19 @@ type Config struct {
 	Agent    AgentConfig   `json:"agent"`
 	Tools    ToolsConfig   `json:"tools"`
 	Safe     SafeConfig    `json:"safe"`
+	Rogue    RogueConfig   `json:"rogue"`
 	GPU      GPUConfig     `json:"gpu"`
+}
+
+// RogueConfig limits /rogue, where actions run without approval. The step
+// budget per message is agent.max_steps unless /rogue on <steps> sets one.
+type RogueConfig struct {
+	MaxMinutes int `json:"max_minutes"` // wall-clock limit per message; 0 = none
 }
 
 type PromptConfig struct {
 	BaseFile        string   `json:"base_file"`         // replaces the built-in base prompt
+	RogueBaseFile   string   `json:"rogue_base_file"`   // replaces the built-in base prompt for rogue mode
 	ExtraFile       string   `json:"extra_file"`        // appended after the base prompt
 	ProjectFiles    []string `json:"project_files"`     // first one found in the workspace root is included
 	ProjectMaxBytes int      `json:"project_max_bytes"` //
@@ -45,13 +62,17 @@ type PromptConfig struct {
 }
 
 type ContextConfig struct {
-	CompactAtTokens       int `json:"compact_at_tokens"`
-	CompactTargetTokens   int `json:"compact_target_tokens"`
-	KeepRecentTokens      int `json:"keep_recent_tokens"`
-	ReserveTokens         int `json:"reserve_tokens"`
-	ReserveTokensThinking int `json:"reserve_tokens_thinking"`
-	ElideToolResultsOver  int `json:"elide_tool_results_over_chars"`
-	SummaryChunkTokens    int `json:"summary_chunk_tokens"`
+	CompactAtTokens     int `json:"compact_at_tokens"`
+	CompactTargetTokens int `json:"compact_target_tokens"`
+	KeepRecentTokens    int `json:"keep_recent_tokens"`
+	// KeepRecentRatio, when set (0 < r <= 0.9), keeps the newest share r of
+	// the conversation verbatim instead of keep_recent_tokens, and the
+	// target follows from it (see agent.compactLimits).
+	KeepRecentRatio       float64 `json:"keep_recent_ratio"`
+	ReserveTokens         int     `json:"reserve_tokens"`
+	ReserveTokensThinking int     `json:"reserve_tokens_thinking"`
+	ElideToolResultsOver  int     `json:"elide_tool_results_over_chars"`
+	SummaryChunkTokens    int     `json:"summary_chunk_tokens"`
 }
 
 type TimeoutConfig struct {
@@ -95,18 +116,20 @@ type GPUConfig struct {
 	SampleSec     int     `json:"sample_seconds"`
 	MaxPauseSec   int     `json:"max_pause_seconds"`
 }
+
 /* "ollama_url": "http://127.0.0.1:11434",
-  "model": "qwen3.8-128k:latest", #"qwen3.8:27b", */
+"model": "qwen3.8-128k:latest", #"qwen3.8:27b", */
 
 func Defaults() *Config {
 	return &Config{
-		OllamaURL: "http://127.0.0.1:11434",
-		Model:     "qwen3.8:27b",
-		NumCtx:    131072,
-		KeepAlive: "1h",
-		Think:     true,
-		Workspace: "./workspace",
-		Color:     "auto",
+		OllamaURL:    "http://127.0.0.1:11434",
+		Model:        "qwen3.8:27b",
+		NumCtx:       131072,
+		KeepAlive:    "1h",
+		Think:        true,
+		Workspace:    "./workspace",
+		SharedAccess: "read",
+		Color:        "auto",
 		Prompt: PromptConfig{
 			ProjectFiles:    []string{"AGENTS.md", "CLAUDE.md"},
 			ProjectMaxBytes: 20000,
@@ -128,6 +151,7 @@ func Defaults() *Config {
 		},
 		Agent: AgentConfig{MaxSteps: 100},
 		Safe:  SafeConfig{MaxBackups: 20},
+		Rogue: RogueConfig{MaxMinutes: 60},
 		Tools: ToolsConfig{
 			Shell:                 "/bin/sh",
 			ExecDefaultTimeoutSec: 120,
@@ -193,6 +217,22 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("CLAUZETTE_WORKSPACE"); v != "" {
 		c.Workspace = v
 	}
+	if v := os.Getenv("CLAUZETTE_AGENT_ID"); v != "" {
+		c.AgentID = v
+	}
+	if v := os.Getenv("CLAUZETTE_AGENT_DIR"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("CLAUZETTE_AGENT_DIR must be true or false, not %q", v)
+		}
+		c.AgentDir = b
+	}
+	if v := os.Getenv("CLAUZETTE_SHARED_ACCESS"); v != "" {
+		c.SharedAccess = v
+	}
+	if c.AgentID == "" {
+		c.AgentID, _ = os.Hostname()
+	}
 	c.OllamaURL = strings.TrimRight(c.OllamaURL, "/")
 	if c.SessionsDir == "" {
 		home, _ := os.UserHomeDir()
@@ -205,6 +245,14 @@ func Load(path string) (*Config, error) {
 		c.AuditLog = filepath.Join(filepath.Dir(c.SessionsDir), "audit.jsonl")
 	}
 	return c, c.validate()
+}
+
+// AgentSessionsDir is where this agent keeps its sessions and backups.
+func (c *Config) AgentSessionsDir() string {
+	if c.AgentDir {
+		return filepath.Join(c.SessionsDir, c.AgentID)
+	}
+	return c.SessionsDir
 }
 
 func (c *Config) validate() error {
@@ -223,14 +271,25 @@ func (c *Config) validate() error {
 	if cc.CompactTargetTokens >= cc.CompactAtTokens {
 		add("context.compact_target_tokens must be below context.compact_at_tokens")
 	}
+	if cc.KeepRecentRatio < 0 || cc.KeepRecentRatio > 0.9 {
+		add("context.keep_recent_ratio must be between 0 (off) and 0.9")
+	}
 	if cc.KeepRecentTokens >= cc.CompactTargetTokens {
 		add("context.keep_recent_tokens must be below context.compact_target_tokens")
 	}
 	if cc.SummaryChunkTokens <= 0 || cc.SummaryChunkTokens > c.NumCtx/2 {
 		add("context.summary_chunk_tokens must be between 1 and num_ctx/2")
 	}
+	switch c.SharedAccess {
+	case "none", "read", "write":
+	default:
+		add("shared_access must be none, read or write")
+	}
 	if c.Tools.Shell == "" {
 		add("tools.shell is empty")
+	}
+	if c.Rogue.MaxMinutes < 0 {
+		add("rogue.max_minutes must be 0 (no limit) or more")
 	}
 	if c.Safe.MaxBackups < 1 {
 		add("safe.max_backups must be at least 1")

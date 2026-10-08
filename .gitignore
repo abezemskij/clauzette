@@ -5,6 +5,9 @@ bin/
 scratch/
 clauzette.local.json
 
+# Local bug notes, committed in batches
+bug_report.md
+
 # Editor and OS noise
 *.swp
 *.swo

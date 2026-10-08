@@ -27,7 +27,25 @@ const (
 	KindInterrupted = "interrupted" // assistant reply cut short by cancellation or an error
 	KindCancelled   = "cancelled"   // tool call that never ran
 	KindNote        = "note"        // transcript-only remark, never sent to the model
+	KindHarness     = "harness"     // message the harness wrote in the user role (plan mode notes and results)
 )
+
+// PendingCall is a tool call captured in plan mode. Only the call is kept,
+// not its prepared action: /plan approve prepares it again against the
+// files as they are then, so the list survives a restart and later actions
+// see the effects of earlier ones.
+type PendingCall struct {
+	Name    string         `json:"name"`
+	Args    map[string]any `json:"args"`
+	Summary string         `json:"summary"` // from planning time, for /plan
+}
+
+// QueuedNote is a harness message waiting to be added to the context at the
+// agent's next safe point (between steps, or at the start of the next turn).
+type QueuedNote struct {
+	Tag  string `json:"tag,omitempty"` // "plan" for plan mode on/off notes
+	Text string `json:"text"`
+}
 
 type Entry struct {
 	ollama.Message
@@ -41,8 +59,9 @@ type Session struct {
 	Created       time.Time `json:"created"`
 	Updated       time.Time `json:"updated"`
 	Model         string    `json:"model"`
-	Date          string    `json:"date"`   // frozen at creation so the system prompt never changes mid-session
-	System        string    `json:"system"` // the assembled system prompt, frozen for the same reason
+	Date          string    `json:"date"`                   // frozen at creation so the system prompt never changes mid-session
+	System        string    `json:"system"`                 // the assembled system prompt, frozen for the same reason
+	SystemRogue   string    `json:"system_rogue,omitempty"` // the same for rogue mode
 	Think         bool      `json:"think"`
 	ShowThinking  bool      `json:"show_thinking"`
 	Safe          bool      `json:"safe"` // safe mode: back up before destructive actions
@@ -53,6 +72,9 @@ type Session struct {
 
 	LastPromptTokens int `json:"last_prompt_tokens"`
 	LastEvalTokens   int `json:"last_eval_tokens"`
+
+	Pending     []*PendingCall `json:"pending,omitempty"`      // plan mode: captured calls awaiting /plan approve
+	QueuedNotes []QueuedNote   `json:"queued_notes,omitempty"` // harness messages not yet in the context
 
 	Context    []Entry `json:"context"`
 	Transcript []Entry `json:"transcript"`
@@ -83,6 +105,10 @@ func NewID() string {
 
 type Store struct {
 	Dir string
+	// Fallback is an older directory that Load also looks in, read-only:
+	// sessions saved before per-agent directories still resume (and are
+	// saved to Dir from then on).
+	Fallback string
 }
 
 func NewStore(dir string) (*Store, error) {
@@ -114,6 +140,9 @@ func (st *Store) Load(id string) (*Session, error) {
 		return nil, fmt.Errorf("invalid session id %q", id)
 	}
 	b, err := os.ReadFile(st.path(id))
+	if errors.Is(err, os.ErrNotExist) && st.Fallback != "" {
+		b, err = os.ReadFile(filepath.Join(st.Fallback, id+".json"))
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("no session %q in %s", id, st.Dir)
