@@ -55,7 +55,11 @@ type Action struct {
 	Summary string
 	Preview string
 	Backups []BackupRef // set by destructive tools; empty for all others
-	Run     func(ctx context.Context) (string, error)
+	// Scope is an optional sub-identity for approval decisions: fetch_url sets
+	// it to the target host so the agent can gate and allowlist by domain.
+	// Empty for every other tool.
+	Scope string
+	Run   func(ctx context.Context) (string, error)
 }
 
 type Tool interface {

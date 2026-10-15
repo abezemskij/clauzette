@@ -29,7 +29,9 @@ type Deps struct {
 	Store    *session.Store
 	Guard    *gpu.Guard
 	Audit    *Audit
-	WS       *tools.Workspace // lets safe-mode restore mark restored files as read
+	WS       *tools.Workspace   // lets safe-mode restore mark restored files as read
+	Todos    *tools.TodoList    // the agent's task plan, shared with the todo tools
+	Fetch    *tools.FetchPolicy // the fetch_url allowlist, shared with the fetch tool
 }
 
 // Agent runs one session. RunTurn and Compact must not run concurrently;
@@ -62,7 +64,7 @@ type Agent struct {
 func New(d Deps, sess *session.Session, events chan<- Event) *Agent {
 	a := &Agent{Deps: d, sess: sess, events: events, cpt: 3.5, always: map[string]bool{}}
 	a.specs = d.Registry.Specs()
-	a.rogueSpecs = append(append([]ollama.ToolSpec(nil), a.specs...), finishSpec())
+	a.rogueSpecs = append(append([]ollama.ToolSpec(nil), a.specs...), finishSpec(), restoreBackupSpec())
 	a.recomputeFixed()
 	a.think.Store(sess.Think)
 	a.show.Store(sess.ShowThinking)
@@ -73,6 +75,17 @@ func New(d Deps, sess *session.Session, events chan<- Event) *Agent {
 	}
 	if sess.CharsPerToken > 0 {
 		a.cpt = sess.CharsPerToken
+	}
+	if a.Todos != nil && len(sess.Todos) > 0 {
+		var items []tools.TodoItem
+		if err := json.Unmarshal(sess.Todos, &items); err == nil {
+			a.Todos.Set(items)
+		}
+	}
+	if a.Fetch != nil {
+		for _, h := range sess.FetchAllowed {
+			a.Fetch.Add(h)
+		}
 	}
 	return a
 }
@@ -173,6 +186,14 @@ func (a *Agent) Save() {
 	a.sess.Safe = a.safe.Load()
 	a.sess.Plan = a.plan.Load()
 	a.sess.CharsPerToken = a.cpt
+	if a.Todos != nil {
+		if b, err := json.Marshal(a.Todos.Items()); err == nil {
+			a.sess.Todos = b
+		}
+	}
+	if a.Fetch != nil {
+		a.sess.FetchAllowed = a.Fetch.List()
+	}
 	a.mu.Lock()
 	err := a.Store.Save(a.sess)
 	a.mu.Unlock()
@@ -437,6 +458,10 @@ func (a *Agent) runTool(ctx context.Context, call ollama.ToolCall) string {
 		rec["decision"] = "rogue"
 		return finish(a.runFinish(args))
 	}
+	if name == restoreBackupTool && a.rt != nil {
+		rec["decision"] = "rogue"
+		return finish(a.runRestoreForModel(args))
+	}
 	t, ok := a.Registry.Get(name)
 	if !ok {
 		return finish(fmt.Sprintf("Error: there is no tool named %q. Available tools: %s.",
@@ -470,48 +495,27 @@ func (a *Agent) runTool(ctx context.Context, call ollama.ToolCall) string {
 // approve uses it for planned ones, so both paths behave identically.
 func (a *Agent) executeAction(ctx context.Context, name string, t tools.Tool, action *tools.Action, rec map[string]any) (string, bool) {
 	rogue := a.rogue.Load()
+	// scoped: fetch_url with the allowlist gate on. A listed host runs without
+	// a prompt (even in manual mode); an unlisted host is always asked about,
+	// even in rogue mode, with the option to add it to the allowlist.
+	scoped := a.Fetch != nil && a.Fetch.GateOn() && action.Scope != ""
 	auto := t.Risk() == tools.ReadOnly || (a.autoApproved(name) && !(a.safe.Load() && t.Risk() == tools.Destructive))
 	switch {
 	case auto:
+		// auto_approve (or a read-only tool) runs without asking, and wins over
+		// the fetch allowlist gate: it is the operator's explicit blanket OK.
 		rec["decision"] = "auto"
+	case scoped && a.Fetch.Allowed(action.Scope):
+		rec["decision"] = "allowlisted"
+	case scoped:
+		if out, isErr, ok := a.askOperator(ctx, name, t, action, rec, action.Scope); !ok {
+			return out, isErr
+		}
 	case rogue:
 		rec["decision"] = "rogue"
 	default:
-		reply := make(chan Decision, 1)
-		summ := action.Summary
-		if a.safe.Load() {
-			switch t.Risk() {
-			case tools.Destructive:
-				summ += " (safe mode: the target is backed up before it runs)"
-			case tools.Exec:
-				summ += " (safe mode: files changed by this command are NOT backed up)"
-			}
-		}
-		a.emit(Event{Kind: EvApproval, Tool: name, Approval: &ApprovalRequest{
-			Tool: name, Summary: summ, Preview: action.Preview, Risk: t.Risk(), Reply: reply,
-		}})
-		select {
-		case d := <-reply:
-			if !d.Approve {
-				rec["decision"] = "denied"
-				out := "The operator denied this action."
-				if d.Reason != "" {
-					out += " Their reason: " + d.Reason
-				}
-				out += " Do not try to reach the same result another way; adjust your plan or ask the operator."
-				return out, true
-			}
-			rec["decision"] = "approved"
-			if d.Always {
-				rec["decision"] = "approved_always"
-				if !a.always[name] {
-					a.always[name] = true
-					a.sess.AlwaysApprove = append(a.sess.AlwaysApprove, name)
-				}
-			}
-		case <-ctx.Done():
-			rec["decision"] = "cancelled"
-			return "Cancelled by the operator before it ran.", true
+		if out, isErr, ok := a.askOperator(ctx, name, t, action, rec, ""); !ok {
+			return out, isErr
 		}
 	}
 
@@ -530,6 +534,87 @@ func (a *Agent) executeAction(ctx context.Context, name string, t tools.Tool, ac
 		return "Error: " + err.Error(), true
 	}
 	return out, false
+}
+
+// askOperator runs the approval prompt and reports whether to proceed. When
+// scope != "", the "always" choice adds scope to the fetch allowlist (and the
+// prompt says so) instead of always-approving the whole tool. On a deny or
+// cancel it returns the message for the model and ok=false.
+func (a *Agent) askOperator(ctx context.Context, name string, t tools.Tool, action *tools.Action, rec map[string]any, scope string) (out string, isErr, ok bool) {
+	reply := make(chan Decision, 1)
+	summ := action.Summary
+	if a.safe.Load() {
+		switch t.Risk() {
+		case tools.Destructive:
+			summ += " (safe mode: the target is backed up before it runs)"
+		case tools.Exec:
+			summ += " (safe mode: files changed by this command are NOT backed up)"
+		}
+	}
+	a.emit(Event{Kind: EvApproval, Tool: name, Approval: &ApprovalRequest{
+		Tool: name, Summary: summ, Preview: action.Preview, Risk: t.Risk(), AllowScope: scope, Reply: reply,
+	}})
+	select {
+	case d := <-reply:
+		if !d.Approve {
+			rec["decision"] = "denied"
+			msg := "The operator denied this action."
+			if d.Reason != "" {
+				msg += " Their reason: " + d.Reason
+			}
+			msg += " Do not try to reach the same result another way; adjust your plan or ask the operator."
+			return msg, true, false
+		}
+		rec["decision"] = "approved"
+		if d.Always {
+			if scope != "" {
+				rec["decision"] = "approved_allowlisted"
+				if a.Fetch != nil {
+					a.Fetch.Add(scope)
+				}
+			} else {
+				rec["decision"] = "approved_always"
+				if !a.always[name] {
+					a.always[name] = true
+					a.sess.AlwaysApprove = append(a.sess.AlwaysApprove, name)
+				}
+			}
+		}
+		return "", false, true
+	case <-ctx.Done():
+		rec["decision"] = "cancelled"
+		return "Cancelled by the operator before it ran.", true, false
+	}
+}
+
+// FetchGate reports whether the fetch allowlist gate is on.
+func (a *Agent) FetchGate() bool { return a.Fetch != nil && a.Fetch.GateOn() }
+
+// SetFetchGate turns the fetch allowlist gate on or off at runtime.
+func (a *Agent) SetFetchGate(on bool) {
+	if a.Fetch != nil {
+		a.Fetch.SetGate(on)
+	}
+}
+
+// FetchAllow adds a host to the allowlist; FetchForget removes one.
+func (a *Agent) FetchAllow(host string) {
+	if a.Fetch != nil {
+		a.Fetch.Add(host)
+	}
+}
+func (a *Agent) FetchForget(host string) {
+	if a.Fetch != nil {
+		a.Fetch.Forget(host)
+	}
+}
+
+// FetchAllowed lists the allowlisted hosts.
+func (a *Agent) FetchAllowed() []string {
+	if a.Fetch == nil {
+		return nil
+	}
+	return a.Fetch.List()
 }
 
 func (a *Agent) updateUsage(res *ollama.Result) {

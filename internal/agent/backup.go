@@ -268,7 +268,9 @@ func (a *Agent) SafeReport() string {
 		case conflictCount(ops) > 0:
 			rel += fmt.Sprintf("  [%d path%s exist now: restore needs force]", conflictCount(ops), pluralFiles(conflictCount(ops)))
 		}
-		fmt.Fprintf(&sb, "%2d  %s  %-12s %s\n", len(entries)-i, e.Time.Format("2006-01-02 15:04:05"), e.Tool, rel)
+		// 1 is the most recent, matching RestoreBackup (entries[n-1]) and the
+		// "backup 1 undoes this restore" wording; entries are newest-first.
+		fmt.Fprintf(&sb, "%2d  %s  %-12s %s\n", i+1, e.Time.Format("2006-01-02 15:04:05"), e.Tool, rel)
 	}
 	sb.WriteString("Restore one with: /safe restore <number> [force]  (force replaces what exists now, after backing it up)")
 	return sb.String()
@@ -322,9 +324,39 @@ func (a *Agent) RestoreBackup(n int, force bool) (string, error) {
 		return "", fmt.Errorf("no backup %d; this session has %d (see /safe)", n, len(entries))
 	}
 	e := entries[n-1]
+	out, err := a.performRestore(e, n, force, "operator")
+	if err != nil {
+		return "", err
+	}
+	suffix := ""
+	if out.Files != 1 {
+		suffix = "s"
+	}
+	msg := fmt.Sprintf("restored backup %d (%s, %d file%s, %s) to its original location; the model was not told, it will re-read if needed",
+		n, out.Time.Format("2006-01-02 15:04:05"), out.Files, suffix, textutil.HumanBytes(out.Bytes))
+	if out.Replaced > 0 {
+		msg += fmt.Sprintf(". %d existing entr%s replaced; they were saved first as backup 1 (/safe restore 1 undoes this restore)", out.Replaced, pluralY(out.Replaced))
+	}
+	return msg, nil
+}
+
+// restoreResult is what a completed restore wrote, for the caller's message.
+type restoreResult struct {
+	Time     time.Time
+	Files    int
+	Bytes    int64
+	Replaced int
+}
+
+// performRestore does the actual work of putting backup e back: it plans the
+// writes, settles conflicts by policy (backing up what it replaces first),
+// writes the entries and audits the result. n is used only for messages and
+// invoker records who asked (operator or model), for the audit log. It is
+// shared by the operator's /safe restore and the model's restore_backup tool.
+func (a *Agent) performRestore(e backupEntry, n int, force bool, invoker string) (restoreResult, error) {
 	ops, err := a.restorePlan(e)
 	if err != nil {
-		return "", fmt.Errorf("backup %d: %v", n, err)
+		return restoreResult{}, fmt.Errorf("backup %d: %v", n, err)
 	}
 	policy := conflictRefuse
 	if force {
@@ -332,7 +364,7 @@ func (a *Agent) RestoreBackup(n int, force bool) (string, error) {
 	}
 	replaced, err := applyPolicy(ops, policy)
 	if err != nil {
-		return "", fmt.Errorf("backup %d: %v", n, err)
+		return restoreResult{}, fmt.Errorf("backup %d: %v", n, err)
 	}
 
 	// Back up what will be replaced before touching anything. Pruning waits
@@ -344,7 +376,7 @@ func (a *Agent) RestoreBackup(n int, force bool) (string, error) {
 			refs = append(refs, l.BackupRef())
 		}
 		if preBackup, err = a.makeBackup("safe_restore", refs); err != nil {
-			return "", fmt.Errorf("could not back up what the restore would replace, so nothing was restored: %v", err)
+			return restoreResult{}, fmt.Errorf("could not back up what the restore would replace, so nothing was restored: %v", err)
 		}
 	}
 	written, err := a.runRestore(ops)
@@ -352,6 +384,7 @@ func (a *Agent) RestoreBackup(n int, force bool) (string, error) {
 	rec := map[string]any{
 		"session":  a.sess.ID,
 		"event":    "safe_restore",
+		"by":       invoker,
 		"backup":   e.Name,
 		"tool":     e.Tool,
 		"refs":     e.Refs,
@@ -367,18 +400,9 @@ func (a *Agent) RestoreBackup(n int, force bool) (string, error) {
 	}
 	a.Audit.Log(rec)
 	if err != nil {
-		return "", fmt.Errorf("restoring backup %d stopped after %d entr%s: %v", n, written, pluralY(written), err)
+		return restoreResult{}, fmt.Errorf("restoring backup %d stopped after %d entr%s: %v", n, written, pluralY(written), err)
 	}
-	suffix := ""
-	if e.Files != 1 {
-		suffix = "s"
-	}
-	msg := fmt.Sprintf("restored backup %d (%s, %d file%s, %s) to its original location; the model was not told, it will re-read if needed",
-		n, e.Time.Format("2006-01-02 15:04:05"), e.Files, suffix, textutil.HumanBytes(e.Bytes))
-	if len(replaced) > 0 {
-		msg += fmt.Sprintf(". %d existing entr%s replaced; they were saved first as backup 1 (/safe restore 1 undoes this restore)", len(replaced), pluralY(len(replaced)))
-	}
-	return msg, nil
+	return restoreResult{Time: e.Time, Files: e.Files, Bytes: e.Bytes, Replaced: len(replaced)}, nil
 }
 
 // restorePlan lists what restoring e would write, and where something

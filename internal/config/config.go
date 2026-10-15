@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"clauzette/internal/tools"
 )
 
 type Config struct {
@@ -44,6 +46,7 @@ type Config struct {
 	Safe     SafeConfig    `json:"safe"`
 	Rogue    RogueConfig   `json:"rogue"`
 	GPU      GPUConfig     `json:"gpu"`
+	Search   SearchConfig  `json:"search"`
 }
 
 // RogueConfig limits /rogue, where actions run without approval. The step
@@ -95,6 +98,28 @@ type ToolsConfig struct {
 	ReadMaxFileBytes      int64    `json:"read_max_file_bytes"`
 	AutoApprove           []string `json:"auto_approve"`
 	Disabled              []string `json:"disabled"`
+
+	// fetch_url settings.
+	FetchMaxBytes     int    `json:"fetch_max_bytes"`     // ceiling on bytes read from a response; default 131072 (128 KB)
+	FetchUserAgent    string `json:"fetch_user_agent"`    // User-Agent header; default a Lynx-like string
+	FetchAllowHTTP    bool   `json:"fetch_allow_http"`    // allow plain http:// as well as https://
+	FetchAllowPrivate bool   `json:"fetch_allow_private"` // allow private/loopback/link-local addresses (internal doc servers)
+
+	FetchAllowlist    bool     `json:"fetch_allowlist"`     // start with the fetch allowlist gate on (toggle at runtime with /fetch)
+	FetchAllowedHosts []string `json:"fetch_allowed_hosts"` // hosts allowed without prompting when the gate is on
+}
+
+// DefaultFetchUserAgent is the fetch User-Agent default, defined once in the
+// tools package (which owns the fetch tool) and re-exported here for Defaults.
+const DefaultFetchUserAgent = tools.DefaultUserAgent
+
+// SearchConfig configures the web_search tool. The tool is enabled only when
+// Provider is set (currently "searxng").
+type SearchConfig struct {
+	Provider     string `json:"provider"`      // "" (off) | "searxng"
+	Endpoint     string `json:"endpoint"`      // base URL of the SearXNG instance
+	MaxResults   int    `json:"max_results"`   // results to return; default 5
+	AllowPrivate bool   `json:"allow_private"` // the endpoint may be an in-cluster (private) address
 }
 
 type SafeConfig struct {
@@ -146,9 +171,10 @@ func Defaults() *Config {
 			InterTokenSeconds: 600,  // Ollama sends nothing while it assembles a tool call, which can be long for big files
 			LoadSeconds:       900,
 		},
-		Agent: AgentConfig{MaxSteps: 100},
-		Safe:  SafeConfig{MaxBackups: 20},
-		Rogue: RogueConfig{MaxMinutes: 60},
+		Agent:  AgentConfig{MaxSteps: 100},
+		Safe:   SafeConfig{MaxBackups: 20},
+		Search: SearchConfig{MaxResults: 5},
+		Rogue:  RogueConfig{MaxMinutes: 60},
 		Tools: ToolsConfig{
 			Shell:                 "/bin/sh",
 			ExecDefaultTimeoutSec: 120,
@@ -156,6 +182,8 @@ func Defaults() *Config {
 			MaxOutputBytes:        30000,
 			ReadDefaultLines:      400,
 			ReadMaxFileBytes:      10 << 20,
+			FetchMaxBytes:         128 << 10,
+			FetchUserAgent:        DefaultFetchUserAgent,
 		},
 		GPU: GPUConfig{
 			Mode:          "temperature",
@@ -241,6 +269,12 @@ func Load(path string) (*Config, error) {
 	if c.AuditLog == "" {
 		c.AuditLog = filepath.Join(filepath.Dir(c.SessionsDir), "audit.jsonl")
 	}
+	if c.Tools.FetchMaxBytes < 1 {
+		c.Tools.FetchMaxBytes = 128 << 10
+	}
+	if c.Tools.FetchUserAgent == "" {
+		c.Tools.FetchUserAgent = DefaultFetchUserAgent
+	}
 	return c, c.validate()
 }
 
@@ -290,6 +324,14 @@ func (c *Config) validate() error {
 	}
 	if c.Safe.MaxBackups < 1 {
 		add("safe.max_backups must be at least 1")
+	}
+	switch c.Search.Provider {
+	case "", "searxng":
+		if c.Search.Provider == "searxng" && strings.TrimSpace(c.Search.Endpoint) == "" {
+			add("search.endpoint is required when search.provider is searxng")
+		}
+	default:
+		add(`search.provider must be "" (off) or "searxng"`)
 	}
 	switch c.GPU.Mode {
 	case "temperature", "utilization", "both":

@@ -87,7 +87,9 @@ func run(cfgFlag string, resume bool, sessionID string, list, printCfg bool) err
 		return err
 	}
 	defer ws.Close()
-	reg := buildRegistry(cfg, ws)
+	todos := tools.NewTodoList()
+	fetchPolicy := tools.NewFetchPolicy(cfg.Tools.FetchAllowlist, cfg.Tools.FetchAllowedHosts)
+	reg := buildRegistry(cfg, ws, todos, fetchPolicy)
 	client := ollama.New(cfg.OllamaURL, ollama.Timeouts{
 		Connect:    secs(cfg.Timeouts.ConnectSeconds),
 		FirstToken: secs(cfg.Timeouts.FirstTokenSeconds),
@@ -110,7 +112,7 @@ func run(cfgFlag string, resume bool, sessionID string, list, printCfg bool) err
 	}
 	defer audit.Close()
 
-	deps := agent.Deps{Cfg: cfg, Client: client, Registry: reg, Store: store, Guard: guard, Audit: audit, WS: ws}
+	deps := agent.Deps{Cfg: cfg, Client: client, Registry: reg, Store: store, Guard: guard, Audit: audit, WS: ws, Todos: todos, Fetch: fetchPolicy}
 	// buildPrompts assembles both system prompts, the normal one and the
 	// one for rogue mode, so a session can switch without rebuilding.
 	buildPrompts := func(date string) (string, string, []string, error) {
@@ -202,7 +204,7 @@ func shareFor(ws *tools.Workspace) string {
 	return ""
 }
 
-func buildRegistry(cfg *config.Config, ws *tools.Workspace) *tools.Registry {
+func buildRegistry(cfg *config.Config, ws *tools.Workspace, todos *tools.TodoList, fetchPolicy *tools.FetchPolicy) *tools.Registry {
 	t := cfg.Tools
 	all := []tools.Tool{
 		&tools.ReadFile{WS: ws, DefaultLines: t.ReadDefaultLines, MaxBytes: t.ReadMaxFileBytes},
@@ -210,6 +212,7 @@ func buildRegistry(cfg *config.Config, ws *tools.Workspace) *tools.Registry {
 		&tools.SearchFiles{WS: ws},
 		&tools.WriteFile{WS: ws},
 		&tools.EditFile{WS: ws},
+		&tools.ApplyPatch{WS: ws},
 		&tools.MvFile{WS: ws},
 		&tools.DeleteFile{WS: ws},
 		&tools.ExecCommand{
@@ -219,6 +222,28 @@ func buildRegistry(cfg *config.Config, ws *tools.Workspace) *tools.Registry {
 			MaxTimeout:     secs(t.ExecMaxTimeoutSec),
 			MaxOutput:      t.MaxOutputBytes,
 		},
+		&tools.GitStatus{WS: ws, MaxOutput: t.MaxOutputBytes, Timeout: secs(t.ExecDefaultTimeoutSec)},
+		&tools.GitDiff{WS: ws, MaxOutput: t.MaxOutputBytes, Timeout: secs(t.ExecDefaultTimeoutSec)},
+		&tools.GitLog{WS: ws, MaxOutput: t.MaxOutputBytes, Timeout: secs(t.ExecDefaultTimeoutSec)},
+		&tools.IPCountry{},
+		&tools.FetchURL{
+			UserAgent:    t.FetchUserAgent,
+			MaxBytes:     t.FetchMaxBytes,
+			AllowHTTP:    t.FetchAllowHTTP,
+			AllowPrivate: t.FetchAllowPrivate,
+			Policy:       fetchPolicy,
+		},
+		&tools.TodoWrite{List: todos},
+		&tools.TodoRead{List: todos},
+	}
+	if cfg.Search.Provider == "searxng" {
+		all = append(all, &tools.WebSearch{
+			Provider: &tools.SearXNG{
+				Endpoint:     cfg.Search.Endpoint,
+				AllowPrivate: cfg.Search.AllowPrivate,
+			},
+			MaxResults: cfg.Search.MaxResults,
+		})
 	}
 	disabled := map[string]bool{}
 	for _, name := range t.Disabled {

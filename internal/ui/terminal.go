@@ -482,6 +482,8 @@ func (u *UI) slash(cmd string) bool {
 		u.block(u.agent.SafeReport())
 	case "/rogue":
 		u.rogue(args)
+	case "/fetch":
+		u.fetch(args)
 	case "/plan":
 		if len(args) > 0 && (strings.EqualFold(args[0], "approve") || strings.EqualFold(args[0], "reject")) {
 			approve := strings.EqualFold(args[0], "approve")
@@ -520,6 +522,56 @@ func (u *UI) slash(cmd string) bool {
 }
 
 // rogue handles /rogue [on [steps]|off].
+// fetch controls the fetch_url allowlist: /fetch shows it, /fetch on|off
+// toggles the gate, /fetch allow|forget <host> edits the list. When the gate
+// is on, fetch_url to a listed host runs without asking (even in rogue mode)
+// and an unlisted host is always asked about.
+func (u *UI) fetch(args []string) {
+	a := u.agent
+	show := func() {
+		state := "off"
+		if a.FetchGate() {
+			state = "on"
+		}
+		u.infof("fetch allowlist gate: %s", state)
+		if hosts := a.FetchAllowed(); len(hosts) > 0 {
+			u.infof("allowed hosts: %s", strings.Join(hosts, ", "))
+		} else {
+			u.infof("allowed hosts: (none yet; approve a fetch with 'a', or /fetch allow <host>)")
+		}
+	}
+	if len(args) == 0 {
+		show()
+		return
+	}
+	switch strings.ToLower(args[0]) {
+	case "on":
+		a.SetFetchGate(true)
+		u.infof("fetch allowlist on: fetch_url to an unlisted host now asks for approval, even in rogue mode")
+	case "off":
+		a.SetFetchGate(false)
+		u.infof("fetch allowlist off: fetch_url follows the normal rules (manual approves, rogue runs)")
+	case "allow":
+		if len(args) != 2 {
+			u.warnf("usage: /fetch allow <host>")
+			return
+		}
+		a.FetchAllow(args[1])
+		a.Save()
+		u.infof("added %s to the fetch allowlist", args[1])
+	case "forget":
+		if len(args) != 2 {
+			u.warnf("usage: /fetch forget <host>")
+			return
+		}
+		a.FetchForget(args[1])
+		a.Save()
+		u.infof("removed %s from the fetch allowlist", args[1])
+	default:
+		u.warnf("usage: /fetch [on|off|allow <host>|forget <host>]")
+	}
+}
+
 func (u *UI) rogue(args []string) {
 	a := u.agent
 	if len(args) == 0 {
@@ -749,7 +801,11 @@ func (u *UI) showApproval(full bool) {
 }
 
 func (u *UI) askApproval() {
-	u.write(u.style(cYellow, fmt.Sprintf("Approve? y / n [reason] / a (always %s) / v (view all): ", u.pending.Tool)))
+	always := fmt.Sprintf("always %s", u.pending.Tool)
+	if u.pending.AllowScope != "" {
+		always = fmt.Sprintf("allowlist %s", u.pending.AllowScope)
+	}
+	u.write(u.style(cYellow, fmt.Sprintf("Approve? y / n [reason] / a (%s) / v (view all): ", always)))
 }
 
 func (u *UI) answerApproval(trimmed, raw string) {
@@ -764,7 +820,11 @@ func (u *UI) answerApproval(trimmed, raw string) {
 		reply(agent.Decision{Approve: true})
 	case lower == "a" || lower == "always":
 		reply(agent.Decision{Approve: true, Always: true})
-		u.infof("%s will run without asking for the rest of this session (/approvals reset to undo)", a.Tool)
+		if a.AllowScope != "" {
+			u.infof("%s added to the fetch allowlist; fetches to it now run without asking (/fetch forget %s to undo)", a.AllowScope, a.AllowScope)
+		} else {
+			u.infof("%s will run without asking for the rest of this session (/approvals reset to undo)", a.Tool)
+		}
 	case lower == "n" || lower == "no":
 		reply(agent.Decision{Approve: false})
 	case strings.HasPrefix(lower, "n ") || strings.HasPrefix(lower, "no "):
@@ -1026,6 +1086,9 @@ While idle:
   /rogue [on [steps]|off]  rogue mode: no approvals, work until the model calls
                     finish (budget: steps or agent.max_steps, rogue.max_minutes);
                     /rogue off also works mid-task
+  /fetch [on|off|allow <host>|forget <host>]  fetch_url allowlist: when on, a
+                    listed host runs without asking (even in rogue), an unlisted
+                    one is always asked about
   /plan             pending actions from plan mode
   /plan approve [n ...|all] [--no-continue] [comment]
                     run pending actions in order; the comment goes to the model
@@ -1038,7 +1101,8 @@ Input:
   Messages typed while the agent works are queued.
   Ctrl+D, Ctrl+C or a dropped connection save the session and exit.
 Approvals:
-  y = yes, n [reason] = no, a = always for this tool in this session, v = show the full diff`)
+  y = yes, n [reason] = no, a = always for this tool in this session
+      (for a gated fetch, a adds the domain to the allowlist instead), v = show the full diff`)
 }
 
 func parseToggle(arg string, current bool) (bool, bool) {

@@ -100,3 +100,27 @@ func TestRoguePromptOverride(t *testing.T) {
 		t.Fatal("a missing prompt.rogue_base_file should be an error")
 	}
 }
+
+func TestPromptWebTools(t *testing.T) {
+	root := t.TempDir()
+	// With fetch_url/web_search present, the environment must say the web is
+	// reachable via tools, not flatly "no internet".
+	sys, _, err := BuildSystemPrompt(config.Defaults(), PromptData{
+		Workspace: root, Tools: []string{"read_file", "fetch_url", "web_search"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sys, "reach the web with these tools: fetch_url, web_search") {
+		t.Fatalf("environment should mention the web tools:\n%s", sys)
+	}
+
+	// Without any web tool, no such claim appears.
+	sys, _, err = BuildSystemPrompt(config.Defaults(), PromptData{Workspace: root, Tools: []string{"read_file"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(sys, "reach the web with these tools") {
+		t.Fatalf("no web tools, but the environment claims web access:\n%s", sys)
+	}
+}

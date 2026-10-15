@@ -13,15 +13,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"clauzette/internal/ollama"
 	"clauzette/internal/session"
+	"clauzette/internal/tools"
 )
 
 const (
-	finishTool   = "finish"
-	rogueNoteTag = "rogue"
+	finishTool        = "finish"
+	restoreBackupTool = "restore_backup"
+	rogueNoteTag      = "rogue"
 )
 
 func finishSpec() ollama.ToolSpec {
@@ -40,6 +43,79 @@ func finishSpec() ollama.ToolSpec {
 			},
 		},
 	}
+}
+
+func restoreBackupSpec() ollama.ToolSpec {
+	return ollama.ToolSpec{
+		Type: "function",
+		Function: ollama.FunctionSpec{
+			Name:        restoreBackupTool,
+			Description: "Rogue mode only: undo an automatic backup. mv_file and delete_file back up their target before they run; this puts one back where it came from. Use it to recover a file or directory you moved or deleted by mistake. With no arguments it restores the most recent backup (n=1); give n for an earlier one. If a path exists again the restore is refused unless force is true (the current version is backed up first, so the restore can itself be undone). It does not undo edit_file, write_file or shell commands.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"n":     map[string]any{"type": "integer", "description": "Which backup to restore; 1 is the most recent. Default 1."},
+					"force": map[string]any{"type": "boolean", "description": "Replace paths that exist now instead of refusing (they are backed up first). Default false."},
+				},
+			},
+		},
+	}
+}
+
+// runRestoreForModel handles the restore_backup tool (rogue mode only): it
+// restores a numbered backup (1 = most recent) so the model can recover from
+// its own mistaken move or delete.
+func (a *Agent) runRestoreForModel(args map[string]any) (string, bool) {
+	if a.rt == nil {
+		return "Error: restore_backup is only available in rogue mode.", true
+	}
+	entries := a.listBackups()
+	if len(entries) == 0 {
+		return "There are no backups to restore. Backups are made automatically before mv_file and delete_file; edit_file, write_file and shell commands are not backed up.", false
+	}
+	ra := tools.Args(args)
+	n, err := ra.Int("n", 1)
+	if err != nil {
+		return "Error: " + err.Error(), true
+	}
+	force, err := ra.Bool("force", false)
+	if err != nil {
+		return "Error: " + err.Error(), true
+	}
+	if n < 1 || n > len(entries) {
+		return fmt.Sprintf("There is no backup %d.\n%s", n, a.backupListForModel(entries)), true
+	}
+	e := entries[n-1]
+	out, err := a.performRestore(e, n, force, "model")
+	if err != nil {
+		return "Error: " + err.Error(), true
+	}
+	suffix := ""
+	if out.Files != 1 {
+		suffix = "s"
+	}
+	msg := fmt.Sprintf("Restored backup %d (%s, %d file%s) to its original location. Re-read the files if you need their current contents.",
+		n, e.Tool, out.Files, suffix)
+	if out.Replaced > 0 {
+		msg += fmt.Sprintf(" %d existing entr%s were replaced and saved first as the new most-recent backup (restore_backup with n=1 undoes this).", out.Replaced, pluralY(out.Replaced))
+	}
+	return msg, false
+}
+
+// backupListForModel is a short listing the model sees when it picks a backup
+// number out of range. 1 is the most recent, matching restore_backup's n.
+func (a *Agent) backupListForModel(entries []backupEntry) string {
+	var sb strings.Builder
+	sb.WriteString("Available backups (1 = most recent):\n")
+	for i, e := range entries {
+		rel := strings.Join(metaRefs(e.Refs), ", ")
+		note := ""
+		if ops, err := a.restorePlan(e); err == nil && conflictCount(ops) > 0 {
+			note = " [needs force: some paths exist now]"
+		}
+		fmt.Fprintf(&sb, "%2d  %-12s %s%s\n", i+1, e.Tool, rel, note)
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // rogueNoteText marks in the conversation where the rules changed; the

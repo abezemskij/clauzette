@@ -73,8 +73,10 @@ type Session struct {
 	LastPromptTokens int `json:"last_prompt_tokens"`
 	LastEvalTokens   int `json:"last_eval_tokens"`
 
-	Pending     []*PendingCall `json:"pending,omitempty"`      // plan mode: captured calls awaiting /plan approve
-	QueuedNotes []QueuedNote   `json:"queued_notes,omitempty"` // harness messages not yet in the context
+	Pending      []*PendingCall  `json:"pending,omitempty"`       // plan mode: captured calls awaiting /plan approve
+	QueuedNotes  []QueuedNote    `json:"queued_notes,omitempty"`  // harness messages not yet in the context
+	Todos        json.RawMessage `json:"todos,omitempty"`         // the agent's task plan, kept opaque here (see tools.TodoList)
+	FetchAllowed []string        `json:"fetch_allowed,omitempty"` // hosts the operator added to the fetch allowlist
 
 	Context    []Entry `json:"context"`
 	Transcript []Entry `json:"transcript"`

@@ -50,7 +50,11 @@ type ApprovalRequest struct {
 	Summary string
 	Preview string
 	Risk    tools.Risk
-	Reply   chan<- Decision // buffered; send exactly once
+	// AllowScope, when set, is the domain this fetch targets: the "always"
+	// choice adds it to the fetch allowlist rather than always-approving the
+	// whole tool, and the prompt says so.
+	AllowScope string
+	Reply      chan<- Decision // buffered; send exactly once
 }
 
 type Event struct {

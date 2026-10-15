@@ -326,4 +326,4 @@ Treat three choices deliberately. Opening internet access lets commands install 
 
 ## Not built yet
 
-Web search and page fetching, an image tool for the model's vision capability, Markdown rendering in the terminal, and a network server mode. The event-based core is designed so these can be added without changing the agent loop.
+An image tool for the model's vision capability, Markdown rendering in the terminal, and a network server mode. The event-based core is designed so these can be added without changing the agent loop. (Page fetching and web search are built — see `fetch_url` and `web_search`, the latter via a configured SearXNG instance.)

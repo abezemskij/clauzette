@@ -63,3 +63,47 @@ func TestKeepRecentRatio(t *testing.T) {
 		}
 	}
 }
+
+func TestFetchDefaults(t *testing.T) {
+	// An omitted fetch section gets the built-in defaults.
+	path := filepath.Join(t.TempDir(), "c.json")
+	os.WriteFile(path, []byte(`{}`), 0o644)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Tools.FetchMaxBytes != 128<<10 {
+		t.Errorf("fetch_max_bytes default = %d, want %d", c.Tools.FetchMaxBytes, 128<<10)
+	}
+	if c.Tools.FetchUserAgent != DefaultFetchUserAgent {
+		t.Errorf("fetch_user_agent default = %q", c.Tools.FetchUserAgent)
+	}
+	// A zero/empty override is normalised back to the defaults.
+	os.WriteFile(path, []byte(`{"tools": {"fetch_max_bytes": 0, "fetch_user_agent": ""}}`), 0o644)
+	c, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Tools.FetchMaxBytes != 128<<10 || c.Tools.FetchUserAgent != DefaultFetchUserAgent {
+		t.Errorf("zero overrides not normalised: %d %q", c.Tools.FetchMaxBytes, c.Tools.FetchUserAgent)
+	}
+}
+
+func TestSearchValidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.json")
+	// searxng without an endpoint is an error.
+	os.WriteFile(path, []byte(`{"search":{"provider":"searxng"}}`), 0o644)
+	if _, err := Load(path); err == nil {
+		t.Fatal("searxng without endpoint was accepted")
+	}
+	// with an endpoint it loads.
+	os.WriteFile(path, []byte(`{"search":{"provider":"searxng","endpoint":"http://searxng:8080"}}`), 0o644)
+	if _, err := Load(path); err != nil {
+		t.Fatalf("valid searxng config rejected: %v", err)
+	}
+	// an unknown provider is an error.
+	os.WriteFile(path, []byte(`{"search":{"provider":"bing"}}`), 0o644)
+	if _, err := Load(path); err == nil {
+		t.Fatal("unknown provider accepted")
+	}
+}

@@ -375,3 +375,51 @@ func TestSharedBackupNeedsWriteAccess(t *testing.T) {
 		t.Fatal("the shared file was not restored")
 	}
 }
+
+// TestSafeReportNumberingMatchesRestore guards against the display and the
+// restore disagreeing: the number shown next to a backup in /safe must be the
+// number that restores it. With two backups, row "1" is the most recent.
+func TestSafeReportNumberingMatchesRestore(t *testing.T) {
+	a, ws, root := newTestAgent(t)
+	// Older backup first, then a newer one, so listBackups orders them
+	// newest-first.
+	for _, name := range []string{"old.txt", "new.txt"} {
+		p := filepath.Join(root, name)
+		if err := os.WriteFile(p, []byte(name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.backupTargets("delete_file", []tools.BackupRef{refFor(t, ws, name)}); err != nil {
+			t.Fatal(err)
+		}
+		os.Remove(p)
+	}
+
+	report := a.SafeReport()
+	// Row "1" must name the most recent backup (new.txt), and "2" the older.
+	lines := strings.Split(report, "\n")
+	var row1, row2 string
+	for _, ln := range lines {
+		switch {
+		case strings.HasPrefix(strings.TrimSpace(ln), "1 "):
+			row1 = ln
+		case strings.HasPrefix(strings.TrimSpace(ln), "2 "):
+			row2 = ln
+		}
+	}
+	if !strings.Contains(row1, "new.txt") {
+		t.Fatalf("row 1 should be the most recent (new.txt):\n%s", report)
+	}
+	if !strings.Contains(row2, "old.txt") {
+		t.Fatalf("row 2 should be the older (old.txt):\n%s", report)
+	}
+	// And restoring "1" must bring back exactly that file (new.txt), not old.txt.
+	if _, err := a.RestoreBackup(1, false); err != nil {
+		t.Fatal(err)
+	}
+	if readString(t, filepath.Join(root, "new.txt")) != "new.txt\n" {
+		t.Fatal("restore 1 did not restore the file shown on row 1")
+	}
+	if _, err := os.Stat(filepath.Join(root, "old.txt")); err == nil {
+		t.Fatal("restore 1 should not have restored old.txt (row 2)")
+	}
+}
