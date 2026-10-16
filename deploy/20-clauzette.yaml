@@ -14,18 +14,42 @@ metadata:
   namespace: ai
 data:
   # Only values that differ from the built-in defaults; see config.example.json.
+  # Fill these in for your setup (config.json is JSON, so it can't hold comments):
+  #  - "model": the Ollama model you pulled (see 10-ollama.yaml).
+  #  - "num_ctx": bound by GPU VRAM. Pick the largest context that keeps the model
+  #    100% on the GPU -- load it and check `ollama ps` shows "100% GPU" (not a
+  #    CPU/GPU split). q8_0 KV cache + flash attention (10-ollama.yaml) stretch it.
+  #  - "gpu": the guard below is written for a DCGM exporter (datacenter GPUs).
+  #    For a CONSUMER GPU scraped by the nvidia_smi exporter, use instead:
+  #      metrics_url  http://<nvidia-gpu-exporter-svc>:9835/metrics
+  #      temp_metric  nvidia_smi_temperature_gpu
+  #      util_metric  nvidia_smi_utilization_gpu_ratio     util_scale 100
+  #  - "search": wires web_search to a SearXNG instance; allow_private lets it
+  #    reach an in-cluster/private endpoint. Remove the block to disable search.
   config.json: |
     {
       "ollama_url": "http://ollama.ai.svc.cluster.local:11434",
-      "model": "qwen3.8:27b",
+      "model": "your-model:tag",
       "num_ctx": 131072,
       "workspace": "/workspace",
       "sessions_dir": "/state/sessions",
       "audit_log": "/state/audit.jsonl",
       "tools": { "shell": "/bin/bash" },
+      "search": {
+        "provider": "searxng",
+        "endpoint": "http://searxng.ai.svc.cluster.local:8080",
+        "max_results": 5,
+        "allow_private": true
+      },
       "gpu": {
         "enabled": true,
-        "metrics_url": "http://nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400/metrics"
+        "metrics_url": "http://nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400/metrics",
+        "mode": "temperature",
+        "temp_metric": "DCGM_FI_DEV_GPU_TEMP",
+        "util_metric": "DCGM_FI_DEV_GPU_UTIL",
+        "util_scale": 1,
+        "pause_above_c": 80,
+        "resume_below_c": 70
       }
     }
 ---

@@ -14,6 +14,8 @@ RUN go vet ./... && go test ./... \
 # projects need (compilers, linters, ...) and remove what you don't want
 # the agent to have (curl, for example, if it should not reach the network).
 FROM debian:bookworm-slim
+# Links the image to its source repo (e.g. GHCR auto-associates the package).
+LABEL org.opencontainers.image.source="https://github.com/abezemskij/clauzette"
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       bash ca-certificates curl diffutils file findutils git grep jq make \
