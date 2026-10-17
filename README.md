@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="media/logo.svg" width="270" alt="Clauzette">
+</p>
+
 # Clauzette
 
 A terminal AI agent for a local Ollama model. It reads, searches, writes and edits files and runs commands, asks before changing anything, keeps its context under control by compacting itself, and pauses when the GPU runs hot. It is built to run as a pod in Kubernetes on a shared workspace, and runs just as well on your own machine.
