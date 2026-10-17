@@ -24,7 +24,7 @@ ssh master → tmux → kubectl exec -it deploy/clauzette -- clauzette
                     ┌──────────────┴──────────────┐
                     │ ui      terminal, ! and / commands, approvals
                     │ agent   session, agent loop, compaction, events
-                    │ tools   read/list/search/write/edit/exec
+                    │ tools   read/list/search/write/edit/exec, patch, git, web, fetch, todo
                     │ ollama  streaming client, phased timeouts
                     │ gpu     exporter sampling, cool-down pauses
                     └──────────────┬──────────────┘
@@ -40,7 +40,7 @@ cmd/clauzette/      entry point, flags, wiring, "idle" mode for the pod
 internal/config/    JSON config, defaults, validation
 internal/ollama/    /api/chat streaming, load, ps, version
 internal/agent/     agent loop, context and compaction, system prompts, plan and rogue modes, backups, warm-up, audit log
-internal/tools/     tool interface, registry, file tools (read, search, write, edit, mv, delete), exec, diff, path confinement
+internal/tools/     tool interface, registry, file tools (read, search, write, edit, mv, delete), exec, apply_patch, read-only git (status/diff/log), web_search, fetch_url, ip_country, todo, diff, path confinement
 internal/session/   session model and store
 internal/gpu/       GPU guard
 internal/ui/        terminal front end
@@ -200,6 +200,7 @@ Type a message and press Enter. While the agent works, its reply streams in, too
 | `/gpu` | GPU guard status |
 | `/approvals [reset]` | Tools that run without asking; forget this session's "always" answers |
 | `/safe [restore <n> [force]]` | Safe mode status and backups; restore one |
+| `/fetch [on\|off\|allow <host>\|forget <host>]` | `fetch_url` host allowlist: show it, gate it on/off, or edit it |
 | `/plan [approve\|reject …]` | Pending actions from plan mode; run or discard them |
 | `/rogue [on [steps]\|off]` | [Rogue mode](#rogue-mode): work unattended until the model finishes |
 | `/help`, `/exit` | Help; save and exit |

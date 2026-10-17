@@ -4,7 +4,7 @@
 
 # Clauzette
 
-A terminal AI agent for a local Ollama model. It reads, searches, writes and edits files and runs commands, asks before changing anything, keeps its context under control by compacting itself, and pauses when the GPU runs hot. It is built to run as a pod in Kubernetes on a shared workspace, and runs just as well on your own machine.
+A terminal AI agent for a local Ollama model. It reads, searches, writes and edits files, runs commands, searches the web and reads git history, asks before changing anything, keeps its context under control by compacting itself, and pauses when the GPU runs hot. It is built to run as a pod in Kubernetes on a shared workspace, and runs just as well on your own machine.
 
 Pure Go standard library, no external dependencies. Linux only.
 
@@ -12,6 +12,7 @@ Pure Go standard library, no external dependencies. Linux only.
 
 - **Approvals with diffs.** Reads run automatically; every write, edit and command shows a diff or the command line and waits for `y`.
 - **Safe workspace access.** File tools are confined to the workspace through `os.Root`, never overwrite files changed by someone else, and handle symlinks safely. Several agents can share one workspace, each in its own directory.
+- **Beyond the workspace.** Web search through a SearXNG instance, URL fetch with a per-host allowlist, read-only git (status, diff, log), an IP-to-country lookup, and a todo list the model keeps for itself on longer tasks.
 - **Modes.** *Safe mode* backs up before moves and deletes. *Plan mode* collects changes for review before anything runs. *Rogue mode* works unattended until the task is done, within a step budget and a time limit.
 - **Long sessions.** Automatic compaction (fixed size or a proportion of the conversation), sessions saved after every step and resumable after a restart, and a complete transcript that is never shortened.
 - **Made for local models.** Stable prompts for Ollama's prompt cache, phased timeouts for slow model loads, a GPU temperature guard, and an audit log of every tool call.
