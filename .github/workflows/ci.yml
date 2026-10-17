@@ -2,8 +2,16 @@ name: ci
 on:
   push:
     branches: [main]
+    paths-ignore:                   # doc/cosmetic-only pushes don't build or deploy
+      - '**.md'
+      - 'media/**'
+      - 'LICENSE'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'media/**'
+      - 'LICENSE'
 
 concurrency:                      # serialize so bump commits don't race
   group: ci-${{ github.ref }}
