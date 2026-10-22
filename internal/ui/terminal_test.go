@@ -2,8 +2,49 @@ package ui
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
+
+// readAll runs readFrom over input and collects the messages it emits.
+func readAll(input string) []inputLine {
+	u := &UI{lines: make(chan inputLine)}
+	go u.readFrom(strings.NewReader(input))
+	var got []inputLine
+	for ln := range u.lines {
+		got = append(got, ln)
+	}
+	return got
+}
+
+func TestReadInput(t *testing.T) {
+	const (
+		start = "\x1b[200~"
+		end   = "\x1b[201~"
+	)
+	cases := []struct {
+		name string
+		in   string
+		want []inputLine
+	}{
+		{"plain lines", "hello\nworld\n", []inputLine{{text: "hello"}, {text: "world"}}},
+		{"empty line kept", "\n", []inputLine{{text: ""}}},
+		{"triple-quote block", "\"\"\"\nx\ny\n\"\"\"\n", []inputLine{{text: "x\ny", literal: true}}},
+		{"paste is one literal message", start + "a\nb\nc" + end + "\n",
+			[]inputLine{{text: "a\nb\nc", literal: true}}},
+		{"paste preserves a leading slash", start + "/not a command" + end + "\n",
+			[]inputLine{{text: "/not a command", literal: true}}},
+		{"text before a paste on the same line", "hi " + start + "p" + end + "\n",
+			[]inputLine{{text: "hi "}, {text: "p", literal: true}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := readAll(c.in); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("readFrom(%q):\n got %#v\nwant %#v", c.in, got, c.want)
+			}
+		})
+	}
+}
 
 func TestParsePlanArgs(t *testing.T) {
 	cases := []struct {

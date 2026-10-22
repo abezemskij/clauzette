@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strconv"
@@ -51,6 +52,16 @@ const (
 	cGreen  = "\x1b[32m"
 	cYellow = "\x1b[33m"
 	cCyan   = "\x1b[36m"
+)
+
+// Bracketed paste. When enabled (pasteOn, emitted in Run on a terminal), the
+// terminal wraps pasted text in pasteStart..pasteEnd, letting readInput take a
+// multi-line paste as one message instead of one message per line.
+const (
+	pasteOn    = "\x1b[?2004h"
+	pasteOff   = "\x1b[?2004l"
+	pasteStart = "\x1b[200~"
+	pasteEnd   = "\x1b[201~"
 )
 
 type UI struct {
@@ -108,6 +119,13 @@ func isTerminal(f *os.File) bool {
 // Run is the main loop. It returns when the operator quits.
 func (u *UI) Run(ctx context.Context) error {
 	u.ctx = ctx
+	// Turn on bracketed paste so a multi-line paste arrives as one message; the
+	// defer restores the terminal on every exit path. Only on a real terminal
+	// (both streams), never when stdin/stdout is piped.
+	if u.tty && isTerminal(os.Stdin) {
+		u.write(pasteOn)
+		defer u.write(pasteOff)
+	}
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigs)
@@ -158,18 +176,24 @@ func (u *UI) Run(ctx context.Context) error {
 	}
 }
 
-// readInput sends complete input lines (or """ blocks) to the main loop.
-func (u *UI) readInput() {
-	r := bufio.NewReader(os.Stdin)
-	var block []string
+// readInput sends complete input lines (or """ blocks) to the main loop. A
+// bracketed paste (pasteStart..pasteEnd, enabled in Run on a terminal) is
+// gathered into one literal message, so a multi-line paste is sent on the next
+// Enter rather than split into a message per line or parsed as commands.
+func (u *UI) readInput() { u.readFrom(os.Stdin) }
+
+// readFrom is readInput's body over any reader, so the paste/""" parsing can be
+// tested without os.Stdin.
+func (u *UI) readFrom(in io.Reader) {
+	r := bufio.NewReader(in)
+	var block []string // lines of an open """ block
+	var paste []string // lines of an open bracketed paste
 	inBlock := false
-	for {
-		line, err := r.ReadString('\n')
-		if err != nil && line == "" {
-			close(u.lines)
-			return
-		}
-		line = strings.TrimRight(line, "\r\n")
+	pasting := false
+
+	// feed runs the ordinary (non-paste) handling for one line: the """ toggle,
+	// or an ordinary line sent as-is.
+	feed := func(line string) {
 		switch {
 		case strings.TrimSpace(line) == `"""`:
 			if inBlock {
@@ -182,6 +206,61 @@ func (u *UI) readInput() {
 		default:
 			u.lines <- inputLine{text: line}
 		}
+	}
+	// endPaste closes the current paste: inside a """ block it joins the block,
+	// otherwise it becomes its own literal message.
+	endPaste := func() {
+		text := strings.Join(paste, "\n")
+		paste = nil
+		pasting = false
+		if inBlock {
+			block = append(block, strings.Split(text, "\n")...)
+		} else if strings.TrimSpace(text) != "" {
+			u.lines <- inputLine{text: text, literal: true}
+		}
+	}
+
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil && line == "" {
+			close(u.lines)
+			return
+		}
+		line = strings.TrimRight(line, "\r\n")
+
+		// A physical line may hold paste markers mixed with ordinary text; walk it
+		// in fragments. consumed guards against emitting a spurious empty line once
+		// a marker has been stripped.
+		remaining := line
+		consumed := false
+		for {
+			if pasting {
+				if j := strings.Index(remaining, pasteEnd); j >= 0 {
+					paste = append(paste, remaining[:j])
+					remaining = remaining[j+len(pasteEnd):]
+					consumed = true
+					endPaste()
+					continue
+				}
+				paste = append(paste, remaining)
+				consumed = true
+				break // the rest of the paste arrives on later reads
+			}
+			if i := strings.Index(remaining, pasteStart); i >= 0 {
+				if before := remaining[:i]; before != "" {
+					feed(before)
+				}
+				remaining = remaining[i+len(pasteStart):]
+				pasting = true
+				consumed = true
+				continue
+			}
+			if remaining != "" || !consumed {
+				feed(remaining)
+			}
+			break
+		}
+
 		if err != nil {
 			close(u.lines)
 			return
@@ -1098,6 +1177,8 @@ While idle:
   /help  /exit
 Input:
   """ on its own line starts and ends a multi-line message.
+  Pasting multiple lines is taken as one message and sent on the next Enter,
+  not split per line (needs a terminal with bracketed paste; most have it).
   Messages typed while the agent works are queued.
   Ctrl+D, Ctrl+C or a dropped connection save the session and exit.
 Approvals:

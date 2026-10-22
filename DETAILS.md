@@ -205,7 +205,7 @@ Type a message and press Enter. While the agent works, its reply streams in, too
 | `/rogue [on [steps]\|off]` | [Rogue mode](#rogue-mode): work unattended until the model finishes |
 | `/help`, `/exit` | Help; save and exit |
 
-**Multi-line input:** a line containing only `"""` starts a block, and another one ends it.
+**Multi-line input:** a line containing only `"""` starts a block, and another one ends it. Pasting several lines at once is also taken as a single message and sent on the next Enter, rather than split into one message per line (via bracketed paste, which clauzette turns on for the session on a terminal; any terminal without it falls back to line-by-line).
 
 **Typing while the agent works** queues the message; it is sent when the current turn finishes.
 
@@ -327,4 +327,4 @@ Treat three choices deliberately. Opening internet access lets commands install 
 
 ## Not built yet
 
-An image tool for the model's vision capability, Markdown rendering in the terminal, and a network server mode. The event-based core is designed so these can be added without changing the agent loop. (Page fetching and web search are built — see `fetch_url` and `web_search`, the latter via a configured SearXNG instance.)
+An image tool for the model's vision capability, Markdown rendering in the terminal, and a network server mode. The event-based core is designed so these can be added without changing the agent loop. (Page fetching and web search are built — see `fetch_url` and `web_search`, the latter via a configured SearXNG instance. `fetch_url` converts HTML to readable text: it drops scripts, styles and markup, decodes entities, and preserves links as a numbered reference list at the end — each resolved to an absolute URL, deduplicated and capped — so the model, including an unattended rogue-mode run, has real addresses to fetch next without the raw HTML flooding the context. Other content types are returned as-is.)
