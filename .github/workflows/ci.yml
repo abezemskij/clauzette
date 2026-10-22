@@ -1,5 +1,6 @@
 name: ci
 on:
+  workflow_dispatch:                # allow a manual run (gh workflow run ci.yml)
   push:
     branches: [main]
     paths-ignore:                   # doc/cosmetic-only pushes don't build or deploy
