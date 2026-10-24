@@ -20,6 +20,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       bash ca-certificates curl diffutils file findutils git grep jq make \
       patch procps ripgrep sed tree unzip xz-utils \
+      build-essential gdb \
+      python3 python3-venv python3-pip \
  && rm -rf /var/lib/apt/lists/*
 RUN useradd --uid 1000 --create-home --home-dir /home/agent --shell /bin/bash agent
 COPY --from=build /out/clauzette /usr/local/bin/clauzette
