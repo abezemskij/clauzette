@@ -4,6 +4,7 @@ bin/
 .local/
 scratch/
 clauzette.local.json
+dev-forward.sh
 
 # Local bug notes, committed in batches
 bug_report.md
