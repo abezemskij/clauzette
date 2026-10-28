@@ -25,6 +25,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 RUN useradd --uid 1000 --create-home --home-dir /home/agent --shell /bin/bash agent
 COPY --from=build /out/clauzette /usr/local/bin/clauzette
+COPY --from=build /usr/local/go /usr/local/go
+ENV PATH=/usr/local/go/bin:/home/agent/go/bin:$PATH
 USER 1000:1000
 WORKDIR /workspace
 ENV CLAUZETTE_CONFIG=/etc/clauzette/config.json
