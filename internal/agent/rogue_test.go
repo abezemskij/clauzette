@@ -315,7 +315,7 @@ func TestFinishOutsideRogue(t *testing.T) {
 
 func TestRogueUsesItsOwnSystemPrompt(t *testing.T) {
 	r := newRogueRig(t, call("finish", map[string]any{"summary": "done"}), say("normal again"))
-	r.a.SetSystems("NORMAL PROMPT", "ROGUE PROMPT")
+	r.a.SetSystems(Prompts{Normal: "NORMAL PROMPT", Rogue: "ROGUE PROMPT"})
 	r.a.SetRogue(true, 0)
 	if err := r.a.RunTurn(context.Background(), "go"); err != nil {
 		t.Fatal(err)

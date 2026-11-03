@@ -39,6 +39,9 @@ func (a *Agent) SetPlan(v bool) bool {
 	if v == a.plan.Load() {
 		return false
 	}
+	if v && a.ChatOnly() {
+		return false // plan mode captures tool calls; the UI explains why
+	}
 	if v {
 		a.SetRogue(false, 0)
 	}
@@ -155,6 +158,7 @@ func (a *Agent) PlanApprove(ctx context.Context, nums []int, opt PlanApproveOpti
 		fmt.Fprintf(&rep, "%d. %s: %s\n", i+1, pc.Name, textutil.OneLine(pc.Summary, 120))
 		rec := map[string]any{"session": a.sess.ID, "tool": pc.Name, "plan": true, "args": auditArgs(pc.Args), "summary": pc.Summary}
 		out, isErr, status, summary := a.runPlanned(ctx, pc, rec)
+		out = tools.Redact(out)
 		rec["error"] = isErr
 		rec["result"] = textutil.OneLine(out, 300)
 		a.Audit.Log(rec)

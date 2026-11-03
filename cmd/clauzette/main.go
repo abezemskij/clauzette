@@ -3,6 +3,7 @@
 //	clauzette               start a new session
 //	clauzette -resume       continue the most recent session
 //	clauzette -session ID   continue a specific session
+//	clauzette -profile P    use model profile P (default: the session's, else default_profile)
 //	clauzette -sessions     list saved sessions
 //	clauzette idle          keep a container running (pod entrypoint)
 package main
@@ -20,6 +21,7 @@ import (
 	"clauzette/internal/agent"
 	"clauzette/internal/config"
 	"clauzette/internal/gpu"
+	"clauzette/internal/modeldb"
 	"clauzette/internal/ollama"
 	"clauzette/internal/session"
 	"clauzette/internal/textutil"
@@ -30,6 +32,12 @@ import (
 var version = "dev"
 
 func main() {
+	// First, before anything else runs: commands the model starts run as
+	// this user, and could otherwise read this process's environment (API
+	// keys) from /proc/<pid>/environ.
+	if err := tools.ProtectProcess(); err != nil {
+		fmt.Fprintf(os.Stderr, "clauzette: warning: could not make the process non-dumpable (%v); commands may be able to read its environment\n", err)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "idle" {
 		idle()
 		return
@@ -37,6 +45,7 @@ func main() {
 	cfgFlag := flag.String("config", "", "config file (default: $CLAUZETTE_CONFIG, ./clauzette.json or /etc/clauzette/config.json)")
 	resume := flag.Bool("resume", false, "resume the most recent session")
 	sessionID := flag.String("session", "", "resume the session with this id")
+	profile := flag.String("profile", "", "model profile to use (default: the resumed session's, else default_profile)")
 	list := flag.Bool("sessions", false, "list saved sessions and exit")
 	printCfg := flag.Bool("print-config", false, "print the effective configuration and exit")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -46,13 +55,13 @@ func main() {
 		fmt.Println("clauzette", version)
 		return
 	}
-	if err := run(*cfgFlag, *resume, *sessionID, *list, *printCfg); err != nil {
+	if err := run(*cfgFlag, *resume, *sessionID, *profile, *list, *printCfg); err != nil {
 		fmt.Fprintln(os.Stderr, "clauzette:", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfgFlag string, resume bool, sessionID string, list, printCfg bool) error {
+func run(cfgFlag string, resume bool, sessionID, profileFlag string, list, printCfg bool) error {
 	cfg, err := config.Load(config.ResolvePath(cfgFlag))
 	if err != nil {
 		return err
@@ -112,58 +121,8 @@ func run(cfgFlag string, resume bool, sessionID string, list, printCfg bool) err
 	}
 	defer audit.Close()
 
-	deps := agent.Deps{Cfg: cfg, Client: client, Registry: reg, Store: store, Guard: guard, Audit: audit, WS: ws, Todos: todos, Fetch: fetchPolicy}
-	// buildPrompts assembles both system prompts, the normal one and the
-	// one for rogue mode, so a session can switch without rebuilding.
-	buildPrompts := func(date string) (string, string, []string, error) {
-		data := agent.PromptData{
-			Date:         date,
-			Workspace:    ws.Root,
-			Share:        shareFor(ws),
-			SharedAccess: ws.Access.String(),
-			Model:        cfg.Model,
-			Shell:        cfg.Tools.Shell,
-			Tools:        reg.Names(),
-			Internet:     cfg.Prompt.InternetAccess,
-			NumCtx:       cfg.NumCtx,
-		}
-		sys, notes, err := agent.BuildSystemPrompt(cfg, data)
-		if err != nil {
-			return "", "", nil, err
-		}
-		data.Rogue = true
-		rogue, rogueNotes, err := agent.BuildSystemPrompt(cfg, data)
-		if err != nil {
-			return "", "", nil, err
-		}
-		seen := map[string]bool{}
-		for _, n := range notes {
-			seen[n] = true
-		}
-		for _, n := range rogueNotes {
-			if !seen[n] {
-				notes = append(notes, "rogue mode: "+n)
-			}
-		}
-		return sys, rogue, notes, nil
-	}
-	newSession := func() (*session.Session, []string, error) {
-		// The date is fixed when the session starts: a value that changes
-		// inside the system prompt would defeat Ollama's prompt cache.
-		date := time.Now().Format("Monday, 2 January 2006")
-		sys, rogue, n, err := buildPrompts(date)
-		if err != nil {
-			return nil, nil, err
-		}
-		now := time.Now()
-		s := &session.Session{
-			ID: session.NewID(), Created: now, Updated: now,
-			Model: cfg.Model, Date: date, System: sys, SystemRogue: rogue,
-			Think: cfg.Think, ShowThinking: cfg.ShowThinking,
-		}
-		return s, n, store.Save(s)
-	}
-
+	// A resumed session is loaded before anything else: its profile decides
+	// which model to use, unless -profile says otherwise.
 	var sess *session.Session
 	resumed := false
 	switch {
@@ -176,13 +135,85 @@ func run(cfgFlag string, resume bool, sessionID string, list, printCfg bool) err
 			sess, err = store.Load(id)
 		}
 		resumed = true
-	default:
-		var n []string
-		sess, n, err = newSession()
-		notes = append(notes, n...)
 	}
 	if err != nil {
 		return err
+	}
+	profile, pnotes, err := agent.SelectProfile(cfg, profileFlag, sess)
+	if err != nil {
+		return err
+	}
+	notes = append(notes, pnotes...)
+	db, err := modeldb.Open(cfg.ModelsFile)
+	if err != nil {
+		notes = append(notes, err.Error())
+	}
+	models := agent.NewModels(cfg, db, profile)
+
+	deps := agent.Deps{Cfg: cfg, Client: client, Models: models, Registry: reg, Store: store, Guard: guard, GPUMem: gpu.NewMemory(cfg.GPU), Audit: audit, WS: ws, Todos: todos, Fetch: fetchPolicy}
+	// buildPrompts assembles the three system prompts (normal, rogue mode,
+	// and chat-only for a model without tools), so a session can switch
+	// without rebuilding.
+	buildPrompts := func(date string) (agent.Prompts, []string, error) {
+		act := models.Active()
+		data := agent.PromptData{
+			Date:         date,
+			Workspace:    ws.Root,
+			Share:        shareFor(ws),
+			SharedAccess: ws.Access.String(),
+			Model:        act.Model,
+			Shell:        cfg.Tools.Shell,
+			Tools:        reg.Names(),
+			Internet:     cfg.Prompt.InternetAccess,
+			NumCtx:       act.NumCtx,
+		}
+		var p agent.Prompts
+		var notes []string
+		seen := map[string]bool{}
+		for _, v := range []struct {
+			label       string
+			rogue, chat bool
+			out         *string
+		}{{"", false, false, &p.Normal}, {"rogue mode: ", true, false, &p.Rogue}, {"chat-only: ", false, true, &p.Chat}} {
+			data.Rogue, data.Chat = v.rogue, v.chat
+			text, n, err := agent.BuildSystemPrompt(cfg, data)
+			if err != nil {
+				return agent.Prompts{}, nil, err
+			}
+			*v.out = text
+			for _, s := range n {
+				if !seen[s] {
+					seen[s] = true
+					notes = append(notes, v.label+s)
+				}
+			}
+		}
+		return p, notes, nil
+	}
+	newSession := func() (*session.Session, []string, error) {
+		// The date is fixed when the session starts: a value that changes
+		// inside the system prompt would defeat Ollama's prompt cache.
+		date := time.Now().Format("Monday, 2 January 2006")
+		p, n, err := buildPrompts(date)
+		if err != nil {
+			return nil, nil, err
+		}
+		act := models.Active()
+		now := time.Now()
+		s := &session.Session{
+			ID: session.NewID(), Created: now, Updated: now,
+			Profile: act.Profile, Model: act.Model, Date: date,
+			System: p.Normal, SystemRogue: p.Rogue, SystemChat: p.Chat,
+			Think: act.Think, ShowThinking: cfg.ShowThinking,
+		}
+		return s, n, store.Save(s)
+	}
+	if sess == nil {
+		var n []string
+		if sess, n, err = newSession(); err != nil {
+			return err
+		}
+		notes = append(notes, n...)
 	}
 
 	u := ui.New(ui.Options{
@@ -206,6 +237,7 @@ func shareFor(ws *tools.Workspace) string {
 
 func buildRegistry(cfg *config.Config, ws *tools.Workspace, todos *tools.TodoList, fetchPolicy *tools.FetchPolicy) *tools.Registry {
 	t := cfg.Tools
+	tools.HideEnv(cfg.KeyEnvNames()...) // API keys stay out of commands
 	all := []tools.Tool{
 		&tools.ReadFile{WS: ws, DefaultLines: t.ReadDefaultLines, MaxBytes: t.ReadMaxFileBytes},
 		&tools.ListDir{WS: ws},

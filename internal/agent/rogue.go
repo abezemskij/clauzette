@@ -149,6 +149,9 @@ func (a *Agent) SetRogue(on bool, steps int) (bool, error) {
 	if on && a.plan.Load() {
 		return false, errors.New("rogue mode cannot be used with plan mode; switch plan mode off first (!plan off)")
 	}
+	if on && a.ChatOnly() {
+		return false, fmt.Errorf("rogue mode needs a model with tool support; %s has none", a.Models.Active().Model)
+	}
 	if steps < 0 {
 		return false, errors.New("the step budget must be a positive number")
 	}
@@ -165,8 +168,12 @@ func (a *Agent) SetRogue(on bool, steps int) (bool, error) {
 }
 
 // toolSpecs are the tool definitions for the next request: the registry's,
-// plus finish in rogue mode.
+// plus finish in rogue mode, and none for a model without tool support
+// (Ollama rejects tools for such a model).
 func (a *Agent) toolSpecs() []ollama.ToolSpec {
+	if a.ChatOnly() {
+		return nil
+	}
 	if a.rogue.Load() {
 		return a.rogueSpecs
 	}
@@ -175,6 +182,9 @@ func (a *Agent) toolSpecs() []ollama.ToolSpec {
 
 // fixed is the size of the system prompt and tool definitions now.
 func (a *Agent) fixed() int {
+	if a.ChatOnly() {
+		return a.chatFixed
+	}
 	if a.rogue.Load() {
 		return a.rogueFixed
 	}
@@ -263,7 +273,8 @@ func (a *Agent) rogueFinal(ctx context.Context, reason string) error {
 		a.warnf("rogue: stopped because %s, and the final summary failed: %v", reason, err)
 		return nil
 	}
-	a.sess.Append(res.Message, "")
+	assignToolCallIDs(res.Message.ToolCalls)
+	a.sess.AppendFrom(res.Message, "", a.Models.Active().Model)
 	a.updateUsage(res)
 	a.Save()
 	if len(res.Message.ToolCalls) > 0 {

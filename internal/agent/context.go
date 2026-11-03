@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"clauzette/internal/config"
 	"clauzette/internal/ollama"
 	"clauzette/internal/session"
 	"clauzette/internal/textutil"
@@ -22,7 +23,7 @@ import (
 // the sample is ignored.
 
 func msgChars(m ollama.Message) int {
-	n := len(m.Content) + len(m.Thinking) + len(m.ToolName) + 16
+	n := len(m.Content) + len(m.Thinking) + len(m.ToolName) + len(m.ToolCallID) + 16
 	for _, tc := range m.ToolCalls {
 		b, _ := json.Marshal(tc)
 		n += len(b)
@@ -43,8 +44,67 @@ func (a *Agent) UsedTokens() int {
 }
 
 // ModelContext is the model's native context length in tokens (0 = unknown),
-// as reported by Ollama via /api/show. The effective cap is min(this, num_ctx).
-func (a *Agent) ModelContext() int { return a.Client.ModelNativeContext() }
+// as reported by Ollama. The window (num_ctx) never exceeds it.
+func (a *Agent) ModelContext() int { return a.Models.Active().Caps.NativeCtx }
+
+// limits are the compaction thresholds in tokens for one window size.
+type limits struct {
+	window, compactAt, target, keepRecent, summaryChunk, reserve, reserveThinking int
+}
+
+// contextLimits computes the thresholds for a window. Fixed token values
+// from the config replace their fraction; if they do not fit this window
+// (e.g. compact_at_tokens above a smaller profile's window), all the
+// fractions are used instead and the returned warning says why.
+func contextLimits(cc config.ContextConfig, window int) (limits, string) {
+	frac := func(f float64) int { return int(f * float64(window)) }
+	pick := func(tokens int, f float64) int {
+		if tokens > 0 {
+			return tokens
+		}
+		return frac(f)
+	}
+	smaller := func(tokens int, f float64) int {
+		n := frac(f)
+		if tokens > 0 && (f <= 0 || tokens < n) {
+			return tokens
+		}
+		return n
+	}
+	l := limits{
+		window:          window,
+		compactAt:       pick(cc.CompactAtTokens, cc.CompactAtFraction),
+		target:          pick(cc.CompactTargetTokens, cc.CompactTargetFraction),
+		keepRecent:      pick(cc.KeepRecentTokens, cc.KeepRecentFraction),
+		summaryChunk:    pick(cc.SummaryChunkTokens, cc.SummaryChunkFraction),
+		reserve:         smaller(cc.ReserveTokens, cc.ReserveFraction),
+		reserveThinking: smaller(cc.ReserveTokensThinking, cc.ReserveThinkFraction),
+	}
+	if l.keepRecent < l.target && l.target < l.compactAt && l.compactAt < window && l.summaryChunk > 0 && l.summaryChunk <= window/2 {
+		return l, ""
+	}
+	if cc.CompactAtTokens <= 0 && cc.CompactTargetTokens <= 0 && cc.KeepRecentTokens <= 0 && cc.SummaryChunkTokens <= 0 {
+		// The fractions alone are inconsistent (config validation prevents
+		// this); use them as they are rather than recurse.
+		return l, ""
+	}
+	fixed := cc
+	fixed.CompactAtTokens, fixed.CompactTargetTokens, fixed.KeepRecentTokens, fixed.SummaryChunkTokens = 0, 0, 0, 0
+	all, _ := contextLimits(fixed, window)
+	return all, fmt.Sprintf("the fixed context.*_tokens values do not fit a %s-token window (compact at %s, target %s, keep %s, summary chunk %s); using the fractions instead (compact at %s)",
+		textutil.KTok(window), textutil.KTok(l.compactAt), textutil.KTok(l.target), textutil.KTok(l.keepRecent), textutil.KTok(l.summaryChunk), textutil.KTok(all.compactAt))
+}
+
+// limits are the thresholds for the active window; a warning about the
+// config is shown once.
+func (a *Agent) limits() limits {
+	l, warning := contextLimits(a.Cfg.Context, a.Window())
+	if warning != "" && warning != a.limitsWarned {
+		a.limitsWarned = warning
+		a.warnf("%s", warning)
+	}
+	return l
+}
 
 // ContextTokens estimates the size of the next request.
 func (a *Agent) ContextTokens() int {
@@ -100,16 +160,16 @@ func (a *Agent) calibrate(sent []ollama.Message, res *ollama.Result) {
 // It runs before every model call, not only between turns, because one
 // large tool result can add tens of thousands of tokens at once.
 func (a *Agent) ensureRoom(ctx context.Context) error {
-	cc := a.Cfg.Context
+	lim := a.limits()
 	used := a.ContextTokens()
-	reserve := cc.ReserveTokens
-	if a.think.Load() {
-		reserve = cc.ReserveTokensThinking
+	reserve := lim.reserve
+	if a.think.Load() && a.ThinkAvailable() {
+		reserve = lim.reserveThinking
 	}
 	switch {
-	case used >= cc.CompactAtTokens:
-		a.info("context at ~%s tokens (threshold %s); compacting", textutil.KTok(used), textutil.KTok(cc.CompactAtTokens))
-	case used+reserve > a.Cfg.NumCtx:
+	case used >= lim.compactAt:
+		a.info("context at ~%s tokens (threshold %s); compacting", textutil.KTok(used), textutil.KTok(lim.compactAt))
+	case used+reserve > lim.window:
 		a.info("context at ~%s tokens leaves less than %s for the reply; compacting", textutil.KTok(used), textutil.KTok(reserve))
 	default:
 		return nil
@@ -125,14 +185,13 @@ func (a *Agent) ensureRoom(ctx context.Context) error {
 //
 // With a ratio, the newest share stays verbatim, and the older part is
 // summarised unless removing old tool output already halves it. Without
-// one, keep_recent_tokens and compact_target_tokens apply as they are.
-func (a *Agent) compactLimits(ratio float64) (keep, target int) {
-	cc := a.Cfg.Context
+// one, the keep and target thresholds for the window apply.
+func (a *Agent) compactLimits(ratio float64, l limits) (keep, target int) {
 	if ratio <= 0 {
-		ratio = cc.KeepRecentRatio
+		ratio = a.Cfg.Context.KeepRecentRatio
 	}
 	if ratio <= 0 {
-		return cc.KeepRecentTokens, cc.CompactTargetTokens
+		return l.keepRecent, l.target
 	}
 	total := a.ContextTokens()
 	msgTokens := total - a.tokens(a.fixed())
@@ -169,9 +228,16 @@ Use at most about 1500 words. Write only the summary.`
 // always stays verbatim. The full transcript is not touched. ratio > 0
 // keeps that share of the conversation for this compaction only.
 func (a *Agent) Compact(ctx context.Context, ratio float64) error {
+	a.syncCPT(a.Models.Active())
+	return a.compact(ctx, ratio, a.limits())
+}
+
+// compact is Compact with explicit thresholds: a model switch compacts for
+// the next model's window while the current model is still loaded.
+func (a *Agent) compact(ctx context.Context, ratio float64, lim limits) error {
 	cc := a.Cfg.Context
 	before := a.ContextTokens()
-	keep, target := a.compactLimits(ratio)
+	keep, target := a.compactLimits(ratio, lim)
 	msgs := a.sess.Context
 	split := a.findSplit(msgs, keep)
 	if split <= 0 {
@@ -192,7 +258,7 @@ func (a *Agent) Compact(ctx context.Context, ratio float64) error {
 		return nil
 	}
 
-	summary, err := a.summarize(ctx, older)
+	summary, err := a.summarize(ctx, older, lim.summaryChunk)
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -219,10 +285,10 @@ func (a *Agent) Compact(ctx context.Context, ratio float64) error {
 	after := a.ContextTokens()
 	a.info("compacted ~%s → ~%s tokens (%d older messages summarized)", textutil.KTok(before), textutil.KTok(after), split)
 	switch {
-	case after >= cc.CompactAtTokens:
-		a.warnf("the context is still at or above context.compact_at_tokens, so compaction will run again; keep less of it verbatim (context.keep_recent_ratio or keep_recent_tokens)")
-	case ratio <= 0 && cc.KeepRecentRatio <= 0 && after > cc.CompactTargetTokens:
-		a.warnf("the context is still above context.compact_target_tokens; consider lowering context.keep_recent_tokens")
+	case after >= lim.compactAt:
+		a.warnf("the context is still at or above the compaction threshold (~%s), so compaction will run again; keep less of it verbatim (context.keep_recent_ratio or keep_recent_fraction)", textutil.KTok(lim.compactAt))
+	case ratio <= 0 && cc.KeepRecentRatio <= 0 && after > lim.target:
+		a.warnf("the context is still above the compaction target (~%s); consider lowering context.keep_recent_fraction", textutil.KTok(lim.target))
 	}
 	a.Save()
 	return nil
@@ -276,7 +342,7 @@ func elide(in []session.Entry, limit int) []session.Entry {
 					}
 					args[key] = v
 				}
-				calls[j] = ollama.ToolCall{Function: ollama.ToolCallFunction{Name: tc.Function.Name, Arguments: args}}
+				calls[j] = ollama.ToolCall{ID: tc.ID, Function: ollama.ToolCallFunction{Name: tc.Function.Name, Arguments: args}}
 			}
 			m.ToolCalls = calls
 		}
@@ -288,8 +354,8 @@ func elide(in []session.Entry, limit int) []session.Entry {
 // summarize writes the summary of the older messages. If they are too long
 // for one request, they are summarized in chunks, each request carrying the
 // summary so far.
-func (a *Agent) summarize(ctx context.Context, older []session.Entry) (string, error) {
-	chunks := a.chunkTranscript(older, a.Cfg.Context.SummaryChunkTokens)
+func (a *Agent) summarize(ctx context.Context, older []session.Entry, chunkTokens int) (string, error) {
+	chunks := a.chunkTranscript(older, chunkTokens)
 	prev := ""
 	for i, chunk := range chunks {
 		var user strings.Builder
@@ -319,23 +385,28 @@ func (a *Agent) summarize(ctx context.Context, older []session.Entry) (string, e
 
 // complete runs a one-off request without tools and without thinking.
 func (a *Agent) complete(ctx context.Context, label, system, user string) (string, error) {
-	think := false
+	act := a.Models.Active()
 	req := ollama.ChatRequest{
-		Model: a.Cfg.Model,
+		Model: act.Model,
 		Messages: []ollama.Message{
 			{Role: "system", Content: system},
 			{Role: "user", Content: user},
 		},
-		Think:     &think,
-		Options:   requestOptions(a.Cfg), // same options, or Ollama reloads the model
-		KeepAlive: a.Cfg.KeepAlive,
+		Think:     act.think(false),
+		Options:   act.RequestOptions(), // same options, or Ollama reloads the model
+		KeepAlive: act.KeepAlive,
+	}
+	b, err := a.backend(act)
+	if err != nil {
+		return "", err
 	}
 	a.emit(Event{Kind: EvWaiting, Text: label})
-	res, err := a.Client.ChatStream(ctx, req, nil)
+	res, err := b.ChatStream(ctx, req, nil)
 	a.emit(Event{Kind: EvWaitingDone})
 	if err != nil {
 		return "", err
 	}
+	newThinkSplitter(act, req).fix(&res.Message) // leaked reasoning must not end up in a summary
 	return res.Message.Content, nil
 }
 
@@ -397,17 +468,27 @@ func (a *Agent) ContextReport() string {
 		s.chars += msgChars(m)
 	}
 	cc := a.Cfg.Context
+	act := a.Models.Active()
+	lim, warning := contextLimits(cc, act.NumCtx)
 	used := a.ContextTokens()
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Context: ~%s of %s tokens (%.0f%%)\n", textutil.KTok(used), textutil.KTok(a.Cfg.NumCtx), 100*float64(used)/float64(a.Cfg.NumCtx))
+	fmt.Fprintf(&sb, "Context: ~%s of %s tokens (%.0f%%) · %s (profile %s)%s\n", textutil.KTok(used), textutil.KTok(lim.window), 100*float64(used)/float64(lim.window),
+		act.Model, act.Profile, map[bool]string{true: " · chat only, no tools", false: ""}[act.ChatOnly()])
 	if n := a.ModelContext(); n > 0 {
-		if a.Cfg.NumCtx < n {
-			fmt.Fprintf(&sb, "  model supports up to %s tokens; num_ctx caps this session at %s\n", textutil.KTok(n), textutil.KTok(a.Cfg.NumCtx))
+		if lim.window < n {
+			fmt.Fprintf(&sb, "  model supports up to %s tokens; num_ctx caps this session at %s\n", textutil.KTok(n), textutil.KTok(lim.window))
 		} else {
 			fmt.Fprintf(&sb, "  model supports up to %s tokens (fully used)\n", textutil.KTok(n))
 		}
 	}
-	fmt.Fprintf(&sb, "  system prompt + tool definitions  ~%s\n", textutil.KTok(a.tokens(a.fixed())))
+	if warning != "" {
+		fmt.Fprintf(&sb, "  note: %s\n", warning)
+	}
+	fixedLabel := "system prompt + tool definitions"
+	if act.ChatOnly() {
+		fixedLabel = "system prompt (no tools)        "
+	}
+	fmt.Fprintf(&sb, "  %s  ~%s\n", fixedLabel, textutil.KTok(a.tokens(a.fixed())))
 	for _, role := range []string{"user", "assistant", "tool"} {
 		if s := stats[role]; s != nil {
 			fmt.Fprintf(&sb, "  %-9s %4d message(s)          ~%s\n", role, s.n, textutil.KTok(a.tokens(s.chars)))
@@ -415,12 +496,12 @@ func (a *Agent) ContextReport() string {
 	}
 	if r := cc.KeepRecentRatio; r > 0 {
 		fmt.Fprintf(&sb, "Compaction at ~%s keeps the newest %.0f%% of the conversation verbatim; the older part loses old tool output and is summarised unless that halves it. Compactions so far: %d.\n",
-			textutil.KTok(cc.CompactAtTokens), r*100, a.sess.Compactions)
+			textutil.KTok(lim.compactAt), r*100, a.sess.Compactions)
 	} else {
 		fmt.Fprintf(&sb, "Compaction at ~%s, down to ~%s, keeping the last ~%s verbatim. Compactions so far: %d.\n",
-			textutil.KTok(cc.CompactAtTokens), textutil.KTok(cc.CompactTargetTokens), textutil.KTok(cc.KeepRecentTokens), a.sess.Compactions)
+			textutil.KTok(lim.compactAt), textutil.KTok(lim.target), textutil.KTok(lim.keepRecent), a.sess.Compactions)
 	}
-	if keep, _ := a.compactLimits(0); len(a.sess.Context) > 0 {
+	if keep, _ := a.compactLimits(0, lim); len(a.sess.Context) > 0 {
 		split := a.findSplit(a.sess.Context, keep)
 		if split <= 0 {
 			sb.WriteString("Compacting now would change nothing: everything is in the recent part.\n")

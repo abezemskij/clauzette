@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -80,7 +79,7 @@ func (g gitRunner) run(ctx context.Context, dir string, gitArgs []string) (strin
 	}
 	cmd := exec.Command("git", gitArgs...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
+	cmd.Env = childEnv(
 		"GIT_PAGER=cat", "PAGER=cat", "GIT_TERMINAL_PROMPT=0", "TERM=dumb", "NO_COLOR=1")
 	out := newCappedBuffer(g.maxOutput)
 	cmd.Stdout = out

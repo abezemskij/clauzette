@@ -9,6 +9,9 @@ dev-forward.sh
 # Local bug notes, committed in batches
 bug_report.md
 
+# Local design notes, not committed
+DESIGN-*.md
+
 # Editor and OS noise
 *.swp
 *.swo

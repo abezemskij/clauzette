@@ -47,6 +47,9 @@ Locally, commands run as your own user with your credentials in reach; read the 
 | `/context`, `/compact [percent]` | Context usage; compact now |
 | `/undo`, `/retry` | Drop the last exchange (and resend it) |
 | `/sessions`, `/new`, `/load <id>` | Manage sessions |
+| `/clear` | Discard this session's conversation and start fresh (files kept) |
+| `/model [name]` | List models and profiles; switch between them |
+| `/adapt [name]` | Find the largest context that keeps a model fully on the GPU |
 | `/plan approve [n\|all] [comment]` | Run planned actions, with a note for the model |
 | `/rogue [on [steps]\|off]` | Unattended mode |
 | `/help` | Everything else |
@@ -59,4 +62,4 @@ The full list, with what each mode does, is in [Using it](DETAILS.md#using-it). 
 
 ## Security
 
-In the pod, the agent can do only what the pod allows: non-root, read-only root filesystem, no capabilities, no Kubernetes token, and network access limited to DNS, Ollama and the GPU exporter. File tools are confined to the workspace, and every tool call is written to an audit log. The shell is not confined beyond the pod, so instructions hidden in files or command output are the main risk: keep approvals on for commands unless the agent runs isolated. See the [Security model](DETAILS.md#security-model).
+In the pod, the agent can do only what the pod allows: non-root, read-only root filesystem, no capabilities, and no Kubernetes token. File tools are confined to the workspace, and every tool call is written to an audit log. Outbound network access is **not** restricted at the network layer: the shipped `NetworkPolicy` (`deploy/30-networkpolicy.yaml`) is inert under a connectivity-only CNI such as flannel, and the agent legitimately reaches DNS, Ollama, SearXNG, Postgres, the GPU exporter and the public Internet (for `fetch_url` and commands). Outbound containment is therefore app-layer — `fetch_url`'s per-host allowlist and SSRF guard, command approvals, and the rogue-mode budget. The shell is not confined beyond the pod, so instructions hidden in files or command output are the main risk: keep approvals on for commands unless the agent runs isolated. The NetworkPolicy becomes a real second line of defence (notably against reaching the cluster's own infrastructure) once a policy-enforcing CNI like Calico or Cilium is installed. Cloud profiles (OpenRouter, OpenAI) send the conversation, including file contents and command output, to that provider; the default stays on the local model. See the [Security model](DETAILS.md#security-model).

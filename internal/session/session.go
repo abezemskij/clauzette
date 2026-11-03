@@ -47,27 +47,41 @@ type QueuedNote struct {
 	Text string `json:"text"`
 }
 
+// Entry is one message with its time and kind. The message is stored in
+// Ollama's JSON layout (it is embedded), so those field names must not change
+// or saved sessions stop loading.
 type Entry struct {
 	ollama.Message
-	Time time.Time `json:"time"`
-	Kind string    `json:"kind,omitempty"`
+	Time  time.Time `json:"time"`
+	Kind  string    `json:"kind,omitempty"`
+	Model string    `json:"model,omitempty"` // on a model's reply: the model that wrote it
 }
 
+// FormatVersion is the session file format written by this version.
+//
+//	1 (or missing): before profiles; had chars_per_token (now ignored on load,
+//	  the estimate lives in the models file)
+//	2: profile, system_chat, tool call ids, the model on each reply
+const FormatVersion = 2
+
 type Session struct {
+	FormatVersion int       `json:"format_version"`
 	ID            string    `json:"id"`
 	Title         string    `json:"title,omitempty"`
 	Created       time.Time `json:"created"`
 	Updated       time.Time `json:"updated"`
+	Profile       string    `json:"profile,omitempty"` // the profile the session uses; "" in format 1
 	Model         string    `json:"model"`
 	Date          string    `json:"date"`                   // frozen at creation so the system prompt never changes mid-session
 	System        string    `json:"system"`                 // the assembled system prompt, frozen for the same reason
 	SystemRogue   string    `json:"system_rogue,omitempty"` // the same for rogue mode
+	SystemChat    string    `json:"system_chat,omitempty"`  // the same for a model without tools
 	Think         bool      `json:"think"`
 	ShowThinking  bool      `json:"show_thinking"`
 	Safe          bool      `json:"safe"` // safe mode: back up before destructive actions
 	Plan          bool      `json:"plan"` // plan mode: capture actions instead of running them
 	AlwaysApprove []string  `json:"always_approve,omitempty"`
-	CharsPerToken float64   `json:"chars_per_token,omitempty"`
+	CloudOK       []string  `json:"cloud_ok,omitempty"` // cloud providers the operator agreed to send this session to
 	Compactions   int       `json:"compactions"`
 
 	LastPromptTokens int `json:"last_prompt_tokens"`
@@ -84,7 +98,12 @@ type Session struct {
 
 // Append adds a message to both the working context and the transcript.
 func (s *Session) Append(m ollama.Message, kind string) {
-	e := Entry{Message: m, Time: time.Now(), Kind: kind}
+	s.AppendFrom(m, kind, "")
+}
+
+// AppendFrom is Append for a model's reply: it records which model wrote it.
+func (s *Session) AppendFrom(m ollama.Message, kind, model string) {
+	e := Entry{Message: m, Time: time.Now(), Kind: kind, Model: model}
 	s.Context = append(s.Context, e)
 	s.Transcript = append(s.Transcript, e)
 }
@@ -125,6 +144,7 @@ func (st *Store) path(id string) string { return filepath.Join(st.Dir, id+".json
 // Save writes the session atomically (temporary file + rename).
 func (st *Store) Save(s *Session) error {
 	s.Updated = time.Now()
+	s.FormatVersion = FormatVersion
 	b, err := json.Marshal(s)
 	if err != nil {
 		return err
@@ -155,8 +175,30 @@ func (st *Store) Load(id string) (*Session, error) {
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, fmt.Errorf("session %s: %w", id, err)
 	}
+	if s.FormatVersion == 0 {
+		s.FormatVersion = 1
+	}
+	if s.FormatVersion > FormatVersion {
+		return nil, fmt.Errorf("session %s was saved by a newer clauzette (format %d; this version reads up to %d)", id, s.FormatVersion, FormatVersion)
+	}
 	return &s, nil
 }
+
+// Delete removes a saved session from Dir. Its safe-mode backups and the
+// audit log are kept; the read-only Fallback directory is not touched.
+func (st *Store) Delete(id string) error {
+	id = strings.TrimSuffix(strings.TrimSpace(id), ".json")
+	if id == "" || strings.ContainsAny(id, `/\`) {
+		return fmt.Errorf("invalid session id %q", id)
+	}
+	if err := os.Remove(st.path(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// BackupDir is where a session's safe-mode backups are kept.
+func (st *Store) BackupDir(id string) string { return filepath.Join(st.Dir, "backups", id) }
 
 type Info struct {
 	ID       string

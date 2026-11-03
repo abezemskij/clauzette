@@ -17,6 +17,17 @@ var basePrompt string
 //go:embed rogue_prompt.md
 var roguePrompt string
 
+//go:embed chat_prompt.md
+var chatPrompt string
+
+// chatEnvTemplate is the environment block for a model without tools: it
+// only states what the model cannot do.
+const chatEnvTemplate = `# Environment
+
+- Today's date: {{.Date}}
+- No tools: the model in use cannot call tools, so you cannot read or change files, run commands or use the network. Work with what the operator writes or pastes.
+- Context window: {{.NumCtx}} tokens. When a conversation gets long, its older part is replaced by a summary.`
+
 const envTemplate = `# Environment
 
 - Today's date: {{.Date}}
@@ -39,6 +50,7 @@ type PromptData struct {
 	Share        string // the shared workspace root, "" when the agent works in the whole workspace
 	SharedAccess string // none | read | write, with Share
 	Rogue        bool   // the prompt for rogue mode
+	Chat         bool   // the prompt for a model without tools
 	Model        string
 	Shell        string
 	Tools        []string
@@ -61,8 +73,11 @@ var webToolNames = map[string]bool{"fetch_url": true, "web_search": true}
 // request: any change to it would invalidate Ollama's prompt cache.
 func BuildSystemPrompt(cfg *config.Config, data PromptData) (string, []string, error) {
 	var notes []string
-	base, file, key := basePrompt, cfg.Prompt.BaseFile, "prompt.base_file"
-	if data.Rogue {
+	base, file, key, env := basePrompt, cfg.Prompt.BaseFile, "prompt.base_file", envTemplate
+	switch {
+	case data.Chat:
+		base, file, key, env = chatPrompt, cfg.Prompt.ChatBaseFile, "prompt.chat_base_file", chatEnvTemplate
+	case data.Rogue:
 		base, file, key = roguePrompt, cfg.Prompt.RogueBaseFile, "prompt.rogue_base_file"
 	}
 	if file != "" {
@@ -89,7 +104,7 @@ func BuildSystemPrompt(cfg *config.Config, data PromptData) (string, []string, e
 			data.WebTools = append(data.WebTools, n)
 		}
 	}
-	parts = append(parts, render("environment", envTemplate, data, &notes))
+	parts = append(parts, render("environment", env, data, &notes))
 	// Common instructions from the shared workspace root first, then the
 	// agent's own, so the agent-specific ones can refine them.
 	if data.Share != "" {

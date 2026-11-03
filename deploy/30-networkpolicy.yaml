@@ -1,6 +1,27 @@
-# The agent pod may talk to DNS, Ollama and the GPU metrics exporter, and
-# nothing else; nothing may connect to it. Only enforced if your CNI
-# supports NetworkPolicy (Calico, Cilium, ...).
+# clauzette / agent egress policy — the "reach the Internet and your own
+# backends, but not the cluster's infrastructure" posture.
+#
+# NOT ENFORCED on a non-policy CNI. flannel (and other connectivity-only CNIs)
+# provides pod networking but does not implement NetworkPolicy, so this object
+# is inert: accepted by the API, enforced by nobody. It ships as the
+# ready-to-enforce artifact for the day a policy CNI is added (Calico in
+# policy-only mode / Canal, or Cilium). Until then, outbound containment is
+# APP-LAYER: fetch_url's per-host allowlist + SSRF guard, command approvals,
+# and the rogue-mode step/time budget.
+#
+# Posture once enforced:
+#   ALLOW  DNS; in-cluster backends (Ollama, SearXNG, Postgres, GPU exporter);
+#          the public Internet (fetch_url and exec_command need it).
+#   DENY   the rest of the cluster/private space — other namespaces and pods,
+#          node IPs, the kube-apiserver/kubelet, and the 169.254.169.254
+#          cloud-metadata endpoint (a classic SSRF target).
+#   DENY   all ingress — nothing connects to the agent.
+#
+# Note: fetch_url is already app-gated, so the real outbound exposure this
+# contains is exec_command. podSelector is app=clauzette; a second agent with a
+# different label needs its own rule or a broader selector. The backend
+# labels, namespaces and ports below are examples: match them to your cluster
+# before turning on an enforcing CNI.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -10,8 +31,9 @@ spec:
   podSelector:
     matchLabels: {app: clauzette}
   policyTypes: [Ingress, Egress]
-  ingress: []
+  ingress: []                       # nothing may connect to the agent
   egress:
+    # DNS (CoreDNS in kube-system)
     - to:
         - namespaceSelector:
             matchLabels: {kubernetes.io/metadata.name: kube-system}
@@ -20,20 +42,44 @@ spec:
       ports:
         - {protocol: UDP, port: 53}
         - {protocol: TCP, port: 53}
+    # Ollama — the model
     - to:
         - podSelector:
             matchLabels: {app: ollama}
       ports:
         - {protocol: TCP, port: 11434}
+    # SearXNG — web_search is proxied through it (it reaches the Internet itself)
+    - to:
+        - podSelector:
+            matchLabels: {app: searxng}
+      ports:
+        - {protocol: TCP, port: 8080}
+    # Postgres — shared by agents
+    - to:
+        - podSelector:
+            matchLabels: {app: postgres}
+      ports:
+        - {protocol: TCP, port: 5432}
+    # GPU metrics exporter — the thermal guard scrapes it in the monitoring ns
     - to:
         - namespaceSelector:
-            matchLabels: {kubernetes.io/metadata.name: gpu-operator}
+            matchLabels: {kubernetes.io/metadata.name: monitoring}
+          podSelector:
+            matchLabels: {app: nvidia-gpu-exporter}
       ports:
-        - {protocol: TCP, port: 9400}
-    # Internet access for commands (package installs, git clone) is a
-    # deliberate choice: it also lets prompt-injected commands send data
-    # out. To allow it, uncomment:
-    # - to:
-    #     - ipBlock:
-    #         cidr: 0.0.0.0/0
-    #         except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+        - {protocol: TCP, port: 9835}
+    # Public Internet for fetch_url and exec_command (package installs, git
+    # clone, ...). The `except` list is what keeps "Internet yes, infrastructure
+    # no": 10.0.0.0/8 covers the cluster pod+service ranges, 192.168.0.0/16 the
+    # node network, plus the rest of RFC1918 and 169.254.0.0/16 link-local
+    # (incl. the metadata endpoint). Narrow or drop this rule for stricter
+    # outbound containment — but fetch_url is already app-gated, so the real
+    # exposure here is exec_command.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16

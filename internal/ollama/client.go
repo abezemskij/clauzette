@@ -13,54 +13,35 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
+
+	"clauzette/internal/llm"
 )
 
-// ErrStalled is returned when Ollama sends nothing for longer than the
+// The message types are defined in package llm and shared with the other
+// providers; these aliases keep this package's names working.
+type (
+	Message          = llm.Message
+	ToolCall         = llm.ToolCall
+	ToolCallFunction = llm.ToolCallFunction
+	ToolSpec         = llm.ToolSpec
+	FunctionSpec     = llm.FunctionSpec
+	ChatRequest      = llm.ChatRequest
+	Result           = llm.Result
+	Timeouts         = llm.Timeouts
+	RunningModel     = llm.RunningModel
+	ModelInfo        = llm.ModelInfo
+)
+
+// ErrStalled is returned when the model sends nothing for longer than the
 // timeout of the current phase (before the first token, or between tokens).
-var ErrStalled = errors.New("no data from ollama within the timeout")
+var ErrStalled = llm.ErrStalled
 
-type ToolCallFunction struct {
-	Name      string         `json:"name"`
-	Arguments map[string]any `json:"arguments"`
-}
-
-type ToolCall struct {
-	Function ToolCallFunction `json:"function"`
-}
-
-type Message struct {
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	Thinking  string     `json:"thinking,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-	ToolName  string     `json:"tool_name,omitempty"`
-}
-
-type FunctionSpec struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"`
-}
-
-type ToolSpec struct {
-	Type     string       `json:"type"`
-	Function FunctionSpec `json:"function"`
-}
-
-type ChatRequest struct {
-	Model     string         `json:"model"`
-	Messages  []Message      `json:"messages"`
-	Tools     []ToolSpec     `json:"tools,omitempty"`
-	Stream    bool           `json:"stream"`
-	Think     *bool          `json:"think,omitempty"`
-	Options   map[string]any `json:"options,omitempty"`
-	KeepAlive string         `json:"keep_alive,omitempty"`
-}
+var _ llm.Local = (*Client)(nil)
 
 type chatChunk struct {
 	Message            Message `json:"message"`
@@ -72,31 +53,6 @@ type chatChunk struct {
 	PromptEvalDuration int64   `json:"prompt_eval_duration"`
 	EvalCount          int     `json:"eval_count"`
 	EvalDuration       int64   `json:"eval_duration"`
-}
-
-// Result is a complete (or, on error, partial) assistant response.
-type Result struct {
-	Message         Message
-	DoneReason      string
-	PromptEvalCount int
-	EvalCount       int
-	LoadDuration    time.Duration
-	PromptDuration  time.Duration
-	EvalDuration    time.Duration
-}
-
-func (r *Result) TokensPerSecond() float64 {
-	if r == nil || r.EvalDuration <= 0 {
-		return 0
-	}
-	return float64(r.EvalCount) / r.EvalDuration.Seconds()
-}
-
-type Timeouts struct {
-	Connect    time.Duration // establishing the TCP connection
-	FirstToken time.Duration // from sending a request to the first streamed data
-	InterToken time.Duration // maximum silence once data is flowing
-	Load       time.Duration // explicit model load (warm-up)
 }
 
 type Client struct {
@@ -178,8 +134,8 @@ func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onDelta func(M
 	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	wd := newWatchdog(c.t.FirstToken, "waiting for the first token", cancel)
-	defer wd.stop()
+	wd := llm.NewWatchdog(c.t.FirstToken, "waiting for the first token", cancel)
+	defer wd.Stop()
 
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/api/chat", bytes.NewReader(body))
 	if err != nil {
@@ -212,9 +168,9 @@ func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onDelta func(M
 		if len(bytes.TrimSpace(line)) > 0 {
 			if !gotFirst {
 				gotFirst = true
-				wd.reset(c.t.InterToken, "waiting for the next token")
+				wd.Reset(c.t.InterToken, "waiting for the next token")
 			} else {
-				wd.kick()
+				wd.Kick()
 			}
 			var ch chatChunk
 			if err := json.Unmarshal(line, &ch); err != nil {
@@ -245,7 +201,7 @@ func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onDelta func(M
 			if done {
 				break
 			}
-			fired, _ := wd.firedPhase()
+			fired, _ := wd.FiredPhase()
 			if errors.Is(rerr, io.EOF) && parent.Err() == nil && !fired {
 				return partial(), errors.New("ollama: the stream ended before the response was complete")
 			}
@@ -258,8 +214,8 @@ func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onDelta func(M
 }
 
 // classify turns a transport error into a cancellation, a stall or a plain error.
-func (c *Client) classify(parent context.Context, wd *watchdog, err error) error {
-	if fired, phase := wd.firedPhase(); fired {
+func (c *Client) classify(parent context.Context, wd *llm.Watchdog, err error) error {
+	if fired, phase := wd.FiredPhase(); fired {
 		return fmt.Errorf("%w (%s)", ErrStalled, phase)
 	}
 	if parent.Err() != nil {
@@ -291,18 +247,60 @@ func (c *Client) Load(ctx context.Context, model string, options map[string]any,
 	return time.Since(start), nil
 }
 
-type RunningModel struct {
-	Name          string    `json:"name"`
-	Model         string    `json:"model"`
-	Size          int64     `json:"size"`
-	SizeVRAM      int64     `json:"size_vram"`
-	ExpiresAt     time.Time `json:"expires_at"`
-	ContextLength int       `json:"context_length"`
+// Unload removes a model from memory now (keep_alive 0), so the next model
+// has the GPU to itself.
+func (c *Client) Unload(ctx context.Context, model string) error {
+	req := ChatRequest{Model: model, Messages: []Message{}, KeepAlive: "0s"}
+	var out struct {
+		Error string `json:"error"`
+	}
+	if err := c.postJSON(ctx, "/api/chat", req, &out); err != nil {
+		return err
+	}
+	if out.Error != "" {
+		return errors.New(out.Error)
+	}
+	return nil
 }
 
-// Matches reports whether this running model is the configured model.
-func (m RunningModel) Matches(model string) bool {
-	return m.Name == model || m.Model == model || m.Name == model+":latest"
+// ListModels lists the installed models.
+func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
+	var out struct {
+		Models []ModelInfo `json:"models"`
+	}
+	if err := c.getJSON(ctx, "/api/tags", &out); err != nil {
+		return nil, err
+	}
+	return out.Models, nil
+}
+
+// weightsRef finds the weights blob in a Modelfile's FROM line.
+var weightsRef = regexp.MustCompile(`sha256[-:]([0-9a-f]{64})`)
+
+// ShowWeights returns the digest of the model's weights blob
+// ("sha256-<hex>"), from the FROM line of its Modelfile, or "" if Ollama does
+// not show one. Unlike the model digest, it stays the same for models that
+// share weights and differ only in Modelfile parameters (num_ctx, template).
+func (c *Client) ShowWeights(ctx context.Context, model string) (string, error) {
+	var out struct {
+		Modelfile string `json:"modelfile"`
+	}
+	if err := c.postJSON(ctx, "/api/show", map[string]any{"name": model}, &out); err != nil {
+		return "", err
+	}
+	return weightsDigest(out.Modelfile), nil
+}
+
+func weightsDigest(modelfile string) string {
+	for _, line := range strings.Split(modelfile, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "FROM ") {
+			continue
+		}
+		if m := weightsRef.FindStringSubmatch(line); m != nil {
+			return "sha256-" + m[1]
+		}
+	}
+	return ""
 }
 
 // PS lists the models currently loaded in memory.
@@ -383,63 +381,4 @@ func apiError(b []byte) string {
 		return s
 	}
 	return "(empty response)"
-}
-
-// watchdog cancels a request when no data arrives within the current
-// phase's timeout. kick() restarts the countdown after each chunk.
-type watchdog struct {
-	mu     sync.Mutex
-	d      time.Duration
-	phase  string
-	timer  *time.Timer
-	fired  bool
-	cancel context.CancelFunc
-}
-
-func newWatchdog(d time.Duration, phase string, cancel context.CancelFunc) *watchdog {
-	w := &watchdog{cancel: cancel}
-	w.reset(d, phase)
-	return w
-}
-
-func (w *watchdog) reset(d time.Duration, phase string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.timer != nil {
-		w.timer.Stop()
-		w.timer = nil
-	}
-	w.d, w.phase = d, phase
-	if d > 0 {
-		w.timer = time.AfterFunc(d, w.fire)
-	}
-}
-
-func (w *watchdog) kick() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.timer != nil {
-		w.timer.Reset(w.d)
-	}
-}
-
-func (w *watchdog) fire() {
-	w.mu.Lock()
-	w.fired = true
-	w.mu.Unlock()
-	w.cancel()
-}
-
-func (w *watchdog) stop() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.timer != nil {
-		w.timer.Stop()
-	}
-}
-
-func (w *watchdog) firedPhase() (bool, string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.fired, w.phase
 }

@@ -5,6 +5,8 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,8 @@ import (
 
 	"clauzette/internal/config"
 	"clauzette/internal/gpu"
+	"clauzette/internal/llm"
+	"clauzette/internal/modeldb"
 	"clauzette/internal/ollama"
 	"clauzette/internal/session"
 	"clauzette/internal/textutil"
@@ -24,10 +28,12 @@ import (
 
 type Deps struct {
 	Cfg      *config.Config
-	Client   *ollama.Client
+	Client   llm.Backend
+	Models   *Models // the active profile; nil = the config's default profile, nothing remembered
 	Registry *tools.Registry
 	Store    *session.Store
 	Guard    *gpu.Guard
+	GPUMem   *gpu.Memory // reads GPU memory on demand (/adapt); nil without gpu.metrics_url
 	Audit    *Audit
 	WS       *tools.Workspace   // lets safe-mode restore mark restored files as read
 	Todos    *tools.TodoList    // the agent's task plan, shared with the todo tools
@@ -56,13 +62,30 @@ type Agent struct {
 	rogueSpecs []ollama.ToolSpec // specs plus finish
 	fixedChars int               // system prompt + tool definitions
 	rogueFixed int               // the same with rogueSpecs
+	chatFixed  int               // the chat-only system prompt (no tool definitions)
 	rt         *rogueTurn        // the current turn in rogue mode, nil otherwise
-	cpt        float64           // estimated characters per token, calibrated from Ollama's counts
-	always     map[string]bool
+	// cpt is the estimated characters per token, calibrated from Ollama's
+	// counts. It belongs to the model's weights, not to the session: it is
+	// read from and written back to the models file (cptKey), shared by all
+	// sessions. cptSaved is the value last written.
+	cpt          float64
+	cptKey       string
+	cptSaved     float64
+	limitsWarned string // last context-limit warning shown, so it is shown once
+	always       map[string]bool
 }
 
+const defaultCPT = 3.5
+
 func New(d Deps, sess *session.Session, events chan<- Event) *Agent {
-	a := &Agent{Deps: d, sess: sess, events: events, cpt: 3.5, always: map[string]bool{}}
+	if d.Models == nil {
+		p, _ := d.Cfg.FindProfile(d.Cfg.DefaultProfileName())
+		d.Models = NewModels(d.Cfg, nil, p)
+	}
+	if d.Models.Local == nil {
+		d.Models.Local = d.Client
+	}
+	a := &Agent{Deps: d, sess: sess, events: events, cpt: defaultCPT, always: map[string]bool{}}
 	a.specs = d.Registry.Specs()
 	a.rogueSpecs = append(append([]ollama.ToolSpec(nil), a.specs...), finishSpec(), restoreBackupSpec())
 	a.recomputeFixed()
@@ -73,9 +96,7 @@ func New(d Deps, sess *session.Session, events chan<- Event) *Agent {
 	for _, name := range sess.AlwaysApprove {
 		a.always[name] = true
 	}
-	if sess.CharsPerToken > 0 {
-		a.cpt = sess.CharsPerToken
-	}
+	a.syncCPT(a.Models.Active())
 	if a.Todos != nil && len(sess.Todos) > 0 {
 		var items []tools.TodoItem
 		if err := json.Unmarshal(sess.Todos, &items); err == nil {
@@ -95,6 +116,7 @@ func (a *Agent) recomputeFixed() {
 	a.fixedChars = len(a.sess.System) + len(specJSON) + 64
 	rogueJSON, _ := json.Marshal(a.rogueSpecs)
 	a.rogueFixed = len(a.rogueSystem()) + len(rogueJSON) + 64
+	a.chatFixed = len(a.chatSystem()) + 64
 }
 
 func (a *Agent) Session() *session.Session { return a.sess }
@@ -106,21 +128,49 @@ func (a *Agent) Safe() bool                { return a.safe.Load() }
 func (a *Agent) SetSafe(v bool)            { a.safe.Store(v) }
 func (a *Agent) Plan() bool                { return a.plan.Load() }
 
-// SetSystems replaces the session's system prompts, the normal one and
-// the one for rogue mode (used by /system-prompt reload, and by /rogue on
-// for sessions saved before rogue mode had its own prompt).
-func (a *Agent) SetSystems(normal, rogue string) {
-	a.sess.System, a.sess.SystemRogue = normal, rogue
+// Model is the active profile; ChatOnly, ThinkAvailable and Window are
+// shortcuts for the UI.
+func (a *Agent) Model() *Active       { return a.Models.Active() }
+func (a *Agent) ChatOnly() bool       { return a.Models.Active().ChatOnly() }
+func (a *Agent) ThinkAvailable() bool { return a.Models.Active().Caps.Thinking }
+func (a *Agent) Window() int          { return a.Models.Active().NumCtx }
+
+// Prompts are a session's frozen system prompts: the normal one, the one
+// for rogue mode, and the one for models without tools.
+type Prompts struct {
+	Normal, Rogue, Chat string
+}
+
+// SetSystems replaces the session's system prompts (used by /system-prompt
+// reload, and to add a prompt missing from sessions saved before it
+// existed).
+func (a *Agent) SetSystems(p Prompts) {
+	a.sess.System, a.sess.SystemRogue, a.sess.SystemChat = p.Normal, p.Rogue, p.Chat
 	a.recomputeFixed()
 }
 
 // HasRogueSystem reports whether the session has a system prompt for rogue mode.
 func (a *Agent) HasRogueSystem() bool { return a.sess.SystemRogue != "" }
 
+// HasChatSystem reports whether the session has a system prompt for chat-only models.
+func (a *Agent) HasChatSystem() bool { return a.sess.SystemChat != "" }
+
 // system is the system prompt for the next request.
 func (a *Agent) system() string {
+	if a.ChatOnly() {
+		return a.chatSystem()
+	}
 	if a.rogue.Load() {
 		return a.rogueSystem()
+	}
+	return a.sess.System
+}
+
+// chatSystem is the prompt for a model without tools, or the normal one in
+// a session that has none.
+func (a *Agent) chatSystem() string {
+	if a.sess.SystemChat != "" {
+		return a.sess.SystemChat
 	}
 	return a.sess.System
 }
@@ -185,7 +235,6 @@ func (a *Agent) Save() {
 	a.sess.ShowThinking = a.show.Load()
 	a.sess.Safe = a.safe.Load()
 	a.sess.Plan = a.plan.Load()
-	a.sess.CharsPerToken = a.cpt
 	if a.Todos != nil {
 		if b, err := json.Marshal(a.Todos.Items()); err == nil {
 			a.sess.Todos = b
@@ -200,18 +249,51 @@ func (a *Agent) Save() {
 	if err != nil {
 		a.warnf("could not save the session: %v", err)
 	}
+	a.saveCPT()
 }
 
-// requestOptions are the Ollama options for every request. They must be the
-// same for all requests (warm-up, turns, compaction): a different num_ctx
-// makes Ollama reload the model.
-func requestOptions(cfg *config.Config) map[string]any {
-	o := make(map[string]any, len(cfg.Options)+1)
-	for k, v := range cfg.Options {
-		o[k] = v
+// syncCPT switches the token estimate to the active model's weights: the
+// value learned in earlier sessions, if any. Until the weights are known,
+// or for weights never seen, the current estimate is kept and refined.
+func (a *Agent) syncCPT(act *Active) {
+	if act.Key == a.cptKey {
+		return
 	}
-	o["num_ctx"] = cfg.NumCtx
-	return o
+	if r, ok := a.Models.DB.Get(act.Key); ok && r.CharsPerToken > 0 {
+		a.cpt = r.CharsPerToken
+		a.cptSaved = r.CharsPerToken
+	}
+	a.cptKey = act.Key
+}
+
+// saveCPT writes the estimate back to the models file when it changed.
+func (a *Agent) saveCPT() {
+	if a.cptKey == "" || a.cpt == a.cptSaved {
+		return
+	}
+	cpt, model := a.cpt, a.Models.Active().Model
+	a.Models.DB.Update(a.cptKey, model, func(r *modeldb.Record) { r.CharsPerToken = cpt })
+	if err := a.Models.DB.Save(); err != nil {
+		a.warnf("could not save the models file: %v", err)
+		return
+	}
+	a.cptSaved = cpt
+}
+
+// newToolCallID returns an id for a tool call that came without one.
+func newToolCallID() string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return "call_" + hex.EncodeToString(b)
+}
+
+// assignToolCallIDs gives every call an id, so its result can name it.
+func assignToolCallIDs(calls []ollama.ToolCall) {
+	for i := range calls {
+		if calls[i].ID == "" {
+			calls[i].ID = newToolCallID()
+		}
+	}
 }
 
 // buildMessages is the exact message list sent to the model: the frozen
@@ -261,6 +343,16 @@ func (a *Agent) runTurn(ctx context.Context, text, kind string) error {
 	a.flushNotes()
 	a.sess.Append(ollama.Message{Role: "user", Content: text}, kind)
 	a.Save()
+	if a.ChatOnly() {
+		// A session in rogue or plan mode resumed with a model without
+		// tools: both modes are about tool calls, so they cannot apply.
+		if a.rogue.Swap(false) {
+			a.warnf("rogue mode switched off: %s has no tool support", a.Models.Active().Model)
+		}
+		if a.plan.Swap(false) {
+			a.warnf("plan mode switched off: %s has no tool support", a.Models.Active().Model)
+		}
+	}
 	rt := a.startRogueTurn()
 	defer func() { a.rt = nil }()
 
@@ -292,13 +384,18 @@ func (a *Agent) runTurn(ctx context.Context, text, kind string) error {
 			a.sess.Append(ollama.Message{Role: "assistant", Content: "[Stopped by the harness: step limit reached before a final answer.]"}, session.KindInterrupted)
 			return nil
 		}
-		if err := a.Guard.Wait(sctx, func(s string) { a.info("%s", s) }); err != nil {
+		guard := a.Guard
+		if a.Models.Active().Cloud != "" {
+			guard = nil // a cloud model does not heat this GPU
+		}
+		if err := guard.Wait(sctx, func(s string) { a.info("%s", s) }); err != nil {
 			if timedOut() {
 				return a.rogueFinal(ctx, rogueTimeLimit)
 			}
 			a.markInterrupted(nil, "")
 			return err
 		}
+		a.syncCPT(a.Models.Active())
 		if err := a.ensureRoom(sctx); err != nil {
 			if timedOut() {
 				return a.rogueFinal(ctx, rogueTimeLimit)
@@ -324,7 +421,8 @@ func (a *Agent) runTurn(ctx context.Context, text, kind string) error {
 			}
 			return err
 		}
-		a.sess.Append(res.Message, "")
+		assignToolCallIDs(res.Message.ToolCalls)
+		a.sess.AppendFrom(res.Message, "", a.Models.Active().Model)
 		a.updateUsage(res)
 		a.Save()
 
@@ -353,7 +451,7 @@ func (a *Agent) runTurn(ctx context.Context, text, kind string) error {
 			if rt != nil && !rt.finished {
 				out += rt.reminder(step)
 			}
-			a.sess.Append(ollama.Message{Role: "tool", ToolName: call.Function.Name, Content: out}, "")
+			a.sess.Append(ollama.Message{Role: "tool", ToolName: call.Function.Name, ToolCallID: call.ID, Content: out}, "")
 			a.Save()
 		}
 		if ctx.Err() != nil {
@@ -384,7 +482,11 @@ func (a *Agent) markInterrupted(res *ollama.Result, note string) {
 	} else {
 		m.Content = strings.TrimSpace(m.Content + "\n\n" + note)
 	}
-	a.sess.Append(m, session.KindInterrupted)
+	model := ""
+	if res != nil {
+		model = a.Models.Active().Model
+	}
+	a.sess.AppendFrom(m, session.KindInterrupted, model)
 }
 
 // cancelRemaining gives every tool call that will not run a result, because
@@ -397,23 +499,29 @@ func (a *Agent) cancelRemaining(calls []ollama.ToolCall) {
 // skipCalls gives each tool call that will not run a result saying why.
 func (a *Agent) skipCalls(calls []ollama.ToolCall, why string) {
 	for _, c := range calls {
-		a.sess.Append(ollama.Message{Role: "tool", ToolName: c.Function.Name, Content: why}, session.KindCancelled)
+		a.sess.Append(ollama.Message{Role: "tool", ToolName: c.Function.Name, ToolCallID: c.ID, Content: why}, session.KindCancelled)
 	}
 }
 
 func (a *Agent) callModel(ctx context.Context, think bool) (*ollama.Result, error) {
+	act := a.Models.Active()
 	msgs := a.buildMessages()
 	req := ollama.ChatRequest{
-		Model:     a.Cfg.Model,
+		Model:     act.Model,
 		Messages:  msgs,
 		Tools:     a.toolSpecs(),
-		Think:     &think,
-		Options:   requestOptions(a.Cfg),
-		KeepAlive: a.Cfg.KeepAlive,
+		Think:     act.think(think),
+		Options:   act.RequestOptions(),
+		KeepAlive: act.KeepAlive,
 	}
+	b, err := a.backend(act)
+	if err != nil {
+		return nil, err
+	}
+	split := newThinkSplitter(act, req)
 	a.emit(Event{Kind: EvWaiting, Text: "waiting for the model"})
 	waiting := true
-	res, err := a.Client.ChatStream(ctx, req, func(d ollama.Message) {
+	res, err := b.ChatStream(ctx, req, func(d ollama.Message) {
 		if waiting {
 			waiting = false
 			a.emit(Event{Kind: EvWaitingDone})
@@ -422,13 +530,25 @@ func (a *Agent) callModel(ctx context.Context, think bool) (*ollama.Result, erro
 			a.emit(Event{Kind: EvThinking, Text: d.Thinking})
 		}
 		if d.Content != "" {
-			a.emit(Event{Kind: EvText, Text: d.Content})
+			thinking, answer := split.delta(d.Content)
+			if thinking != "" {
+				a.emit(Event{Kind: EvThinking, Text: thinking})
+			}
+			if answer != "" {
+				a.emit(Event{Kind: EvText, Text: answer})
+			}
 		}
 	})
 	if waiting {
 		a.emit(Event{Kind: EvWaitingDone})
 	}
+	if late := split.late(); late != "" {
+		a.emit(Event{Kind: EvText, Text: late})
+	}
 	a.emit(Event{Kind: EvStreamEnd})
+	if res != nil {
+		split.fix(&res.Message)
+	}
 	if err == nil {
 		a.calibrate(msgs, res)
 	}
@@ -446,6 +566,7 @@ func (a *Agent) runTool(ctx context.Context, call ollama.ToolCall) string {
 	start := time.Now()
 	rec := map[string]any{"session": a.sess.ID, "tool": name, "args": auditArgs(call.Function.Arguments)}
 	finish := func(out string, isErr bool) string {
+		out = tools.Redact(out)
 		rec["duration_ms"] = time.Since(start).Milliseconds()
 		rec["error"] = isErr
 		rec["result"] = textutil.OneLine(out, 300)
@@ -627,7 +748,7 @@ func (a *Agent) updateUsage(res *ollama.Result) {
 func (a *Agent) Usage(res *ollama.Result) Usage {
 	u := Usage{
 		Tokens:     a.ContextTokens(),
-		NumCtx:     a.Cfg.NumCtx,
+		NumCtx:     a.Window(),
 		PromptEval: a.sess.LastPromptTokens,
 		Eval:       a.sess.LastEvalTokens,
 	}

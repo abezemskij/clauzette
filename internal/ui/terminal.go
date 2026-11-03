@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"clauzette/internal/agent"
+	"clauzette/internal/config"
 	"clauzette/internal/session"
 	"clauzette/internal/textutil"
 	"clauzette/internal/tools"
@@ -26,8 +27,8 @@ import (
 type Options struct {
 	Deps       agent.Deps
 	NewSession func() (*session.Session, []string, error)
-	// BuildPrompts assembles the normal and the rogue-mode system prompt.
-	BuildPrompts func(date string) (normal, rogue string, notes []string, err error)
+	// BuildPrompts assembles the system prompts: normal, rogue mode, chat-only.
+	BuildPrompts func(date string) (agent.Prompts, []string, error)
 	Notes        []string
 	Resumed      bool
 }
@@ -75,7 +76,12 @@ type UI struct {
 
 	turnDone   chan error
 	busy       bool
-	busyKind   string // "turn" or "compact"
+	busyKind   string     // "turn", "compact" or "model"
+	nextModel  string     // a /model switch typed while busy, applied when the operation ends
+	nextOK     string     // the cloud endpoint approved for nextModel, recorded once the switch succeeds
+	clearID    string     // session id awaiting the y/N answer to /clear
+	cloudModel string     // /model target awaiting the y/N answer to sending the session to a cloud provider
+	cloudTurn  *cloudTurn // a message held until the operator approves the active cloud endpoint
 	cancelBusy context.CancelFunc
 	queue      []string
 	pending    *agent.ApprovalRequest
@@ -161,7 +167,9 @@ func (u *UI) Run(ctx context.Context) error {
 		case <-u.warmDone:
 			u.warm = true
 			u.warmDone = nil // a nil channel never fires again
-			if !u.busy && !u.startNextQueued() {
+			if u.askCloudStart() {
+				u.refreshPrompt()
+			} else if !u.busy && !u.startNextQueued() {
 				u.refreshPrompt()
 			}
 		case <-u.waitC:
@@ -286,6 +294,60 @@ func (u *UI) handleInput(in inputLine) bool {
 			return false
 		}
 	}
+	if ct := u.cloudTurn; ct != nil {
+		u.cloudTurn = nil
+		yes := !in.literal && (strings.EqualFold(trimmed, "y") || strings.EqualFold(trimmed, "yes"))
+		switch {
+		case yes && ct.text == "" && !ct.retry: // asked at the start of the session
+			u.agent.ApproveCloud(ct.endpoint)
+			u.infof("approved %s for this session", ct.endpoint)
+			if u.busy || !u.startNextQueued() {
+				u.promptLine()
+			}
+		case yes:
+			u.agent.ApproveCloud(ct.endpoint)
+			u.sendTurn(ct.text, ct.retry)
+		default:
+			u.infof("nothing was sent; you will be asked again with your next message, or /model <local profile> switches to a local model")
+			if ct.text != "" && !ct.retry {
+				u.infof("your message: %s", textutil.OneLine(ct.text, 80))
+			}
+			if n := len(u.queue); n > 0 {
+				u.infof("dropped %d queued message(s) as well", n)
+				u.queue = nil
+			}
+			u.promptLine()
+		}
+		return false
+	}
+	if u.cloudModel != "" {
+		name := u.cloudModel
+		u.cloudModel = ""
+		if !in.literal && (strings.EqualFold(trimmed, "y") || strings.EqualFold(trimmed, "yes")) {
+			_, endpoint := u.agent.CloudTarget(name)
+			u.switchToApproved(name, endpoint)
+		} else {
+			u.infof("not switched")
+		}
+		if !u.busy {
+			u.promptLine()
+		}
+		return false
+	}
+	if u.clearID != "" {
+		id := u.clearID
+		u.clearID = ""
+		answer := !in.literal && (strings.EqualFold(trimmed, "y") || strings.EqualFold(trimmed, "yes"))
+		if answer && u.agent.Session().ID == id {
+			u.clearSession()
+		} else {
+			u.infof("kept the session")
+		}
+		if !u.busy {
+			u.promptLine()
+		}
+		return false
+	}
 	if u.pending != nil {
 		u.answerApproval(trimmed, text)
 		return false
@@ -301,6 +363,12 @@ func (u *UI) handleInput(in inputLine) bool {
 		// how the operator takes back control without cancelling.
 		if u.busy && strings.EqualFold(strings.Join(strings.Fields(trimmed), " "), "/rogue off") {
 			u.rogue([]string{"off"})
+			return false
+		}
+		// /model works mid-task too: the list is read-only, and a switch is
+		// queued until the current operation ends.
+		if f := strings.Fields(trimmed); u.busy && len(f) > 0 && strings.EqualFold(f[0], "/model") {
+			u.model(f[1:])
 			return false
 		}
 		if u.busy {
@@ -369,6 +437,10 @@ func (u *UI) control(cmd string) bool {
 			u.warnf("usage: !think [on|off]")
 			return false
 		}
+		if !u.agent.ThinkAvailable() {
+			u.warnf("%s has no thinking mode; !think has no effect", u.agent.Model().Model)
+			return false
+		}
 		u.agent.SetThink(v)
 		when := ""
 		if u.busy {
@@ -407,6 +479,10 @@ func (u *UI) control(cmd string) bool {
 		v, ok := parseToggle(arg, u.agent.Plan())
 		if !ok {
 			u.warnf("usage: !plan [on|off]")
+			return false
+		}
+		if v && u.agent.ChatOnly() {
+			u.warnf("plan mode needs a model with tool support; %s has none", u.agent.Model().Model)
 			return false
 		}
 		wasRogue := u.agent.Rogue()
@@ -471,6 +547,20 @@ func (u *UI) slash(cmd string) bool {
 			return false
 		}
 		u.switchSession(s, notes)
+	case "/clear":
+		s := u.agent.Session()
+		msgs := 0
+		for _, e := range s.Transcript {
+			if e.Kind != session.KindNote {
+				msgs++
+			}
+		}
+		if msgs == 0 {
+			u.infof("this session has no messages yet; nothing to clear")
+			return false
+		}
+		u.clearID = s.ID
+		u.warnf("/clear discards this session's %d-message conversation and starts a new one; files you worked on and safe-mode backups are kept. Clear it? [y/N]", msgs)
 	case "/load":
 		if len(args) == 0 {
 			u.warnf("usage: /load <session id> (see /sessions)")
@@ -490,6 +580,10 @@ func (u *UI) slash(cmd string) bool {
 		}
 		u.infof("removed the last exchange from the context. Files changed by tools are not restored. The next request re-reads the conversation.")
 	case "/retry":
+		if e := u.agent.CloudApprovalNeeded(); e != "" {
+			u.askCloudTurn(&cloudTurn{endpoint: e, retry: true})
+			return false
+		}
 		text, err := u.agent.Undo()
 		if err != nil {
 			u.warnf("%v", err)
@@ -502,20 +596,27 @@ func (u *UI) slash(cmd string) bool {
 	case "/system-prompt":
 		if len(args) > 0 && strings.EqualFold(args[0], "reload") {
 			s := u.agent.Session()
-			sys, rogue, notes, err := u.opt.BuildPrompts(s.Date)
+			p, notes, err := u.opt.BuildPrompts(s.Date)
 			if err != nil {
 				u.errorf("%v", err)
 				return false
 			}
-			u.agent.SetSystems(sys, rogue)
+			u.agent.SetSystems(p)
 			u.agent.Save()
 			for _, n := range notes {
 				u.infof("%s", n)
 			}
-			u.infof("system prompts rebuilt (normal %d, rogue mode %d characters); the next request re-reads the whole conversation", len(sys), len(rogue))
+			u.infof("system prompts rebuilt (normal %d, rogue mode %d, chat-only %d characters); the next request re-reads the whole conversation", len(p.Normal), len(p.Rogue), len(p.Chat))
 		} else {
 			s := u.agent.Session()
-			if u.agent.Rogue() {
+			if u.agent.ChatOnly() {
+				u.infof("the system prompt for a model without tools (in use now):")
+				if s.SystemChat != "" {
+					u.block(s.SystemChat)
+				} else {
+					u.block(s.System)
+				}
+			} else if u.agent.Rogue() {
 				u.infof("the system prompt for rogue mode (in use now):")
 				if s.SystemRogue != "" {
 					u.block(s.SystemRogue)
@@ -527,6 +628,10 @@ func (u *UI) slash(cmd string) bool {
 				u.block(s.System)
 			}
 		}
+	case "/model":
+		u.model(args)
+	case "/adapt":
+		u.adapt(args)
 	case "/gpu":
 		u.block(u.opt.Deps.Guard.Report())
 	case "/approvals":
@@ -679,12 +784,12 @@ func (u *UI) rogue(args []string) {
 		if !a.HasRogueSystem() {
 			// a session saved before rogue mode had its own system prompt
 			s := a.Session()
-			_, rogue, _, err := u.opt.BuildPrompts(s.Date)
+			p, _, err := u.opt.BuildPrompts(s.Date)
 			if err != nil {
 				u.errorf("could not build the rogue-mode system prompt: %v", err)
 				return
 			}
-			a.SetSystems(s.System, rogue) // the normal prompt stays as it was frozen
+			a.SetSystems(agent.Prompts{Normal: s.System, Rogue: p.Rogue, Chat: s.SystemChat}) // the other prompts stay as they were frozen
 		}
 		if _, err := a.SetRogue(true, steps); err != nil {
 			u.warnf("%v", err)
@@ -728,16 +833,73 @@ func (u *UI) rogueLimits() string {
 	return s + ", until the model calls finish"
 }
 
+// clearSession discards the current session and starts a new one in its
+// place, so a throwaway conversation does not linger in /sessions. It
+// removes only the session's own record: files the agent worked on, the
+// session's safe-mode backups and the audit log are left as they are.
+func (u *UI) clearSession() {
+	old := u.agent.Session()
+	store := u.opt.Deps.Store
+	s, notes, err := u.opt.NewSession()
+	if err != nil {
+		u.errorf("could not start a new session, so the old one was kept: %v", err)
+		return
+	}
+	if err := store.Delete(old.ID); err != nil {
+		u.warnf("started a new session, but the old one could not be removed from %s: %v", store.Dir, err)
+	}
+	if u.opt.Deps.Audit != nil {
+		u.opt.Deps.Audit.Log(map[string]any{"session": old.ID, "event": "cleared"})
+	}
+	u.switchSession(s, notes)
+	u.infof("cleared the previous session (%s)", old.ID)
+}
+
 func (u *UI) switchSession(s *session.Session, notes []string) {
 	u.agent = agent.New(u.opt.Deps, s, u.events)
 	u.infof("session %s: %d messages in context", s.ID, len(s.Context))
 	for _, n := range notes {
 		u.infof("%s", n)
 	}
-	if s.Model != "" && s.Model != u.opt.Deps.Cfg.Model {
-		u.warnf("this session was started with %s; continuing with %s", s.Model, u.opt.Deps.Cfg.Model)
-	}
+	u.warnModelChange(s)
+	u.ensureChatPrompt()
+	u.askCloudStart()
 	u.showLastReply(s)
+}
+
+// warnModelChange says when a session continues with a different model
+// than it last used (/load keeps the model that is loaded now), and how to
+// switch back.
+func (u *UI) warnModelChange(s *session.Session) {
+	m := u.agent.Model().Model
+	if s.Model == "" || s.Model == m {
+		return
+	}
+	u.warnf("this session last used %s; continuing with %s", s.Model, m)
+	back := s.Profile
+	if back == "" {
+		back = s.Model
+	}
+	u.infof("/model %s switches back", back)
+}
+
+// ensureChatPrompt adds the chat-only system prompt to a session saved
+// before it existed, so a model without tools never gets the prompt that
+// describes tools. The normal and rogue-mode prompts stay as they were
+// frozen.
+func (u *UI) ensureChatPrompt() {
+	a := u.agent
+	if a.HasChatSystem() || u.opt.BuildPrompts == nil {
+		return
+	}
+	s := a.Session()
+	p, _, err := u.opt.BuildPrompts(s.Date)
+	if err != nil {
+		u.warnf("could not build the chat-only system prompt: %v", err)
+		return
+	}
+	a.SetSystems(agent.Prompts{Normal: s.System, Rogue: s.SystemRogue, Chat: p.Chat})
+	a.Save()
 }
 
 func (u *UI) listSessions() {
@@ -766,8 +928,57 @@ func (u *UI) listSessions() {
 	u.block(strings.TrimRight(sb.String(), "\n"))
 }
 
+// cloudTurn is a message (or a /retry) waiting for the operator to approve
+// sending the session to the active cloud endpoint.
+type cloudTurn struct {
+	endpoint string
+	text     string
+	retry    bool
+}
+
+func (u *UI) askCloudTurn(ct *cloudTurn) {
+	u.cloudTurn = ct
+	u.warnf("the active model runs on %s: this conversation, including the file contents and command output in it, is sent there. Send? [y/N]", ct.endpoint)
+}
+
+// askCloudStart asks up front when the session starts on a cloud endpoint
+// it has not approved (-profile, default_profile, -resume, /new, /clear,
+// /load), instead of waiting for the first message. It reports whether it
+// asked.
+func (u *UI) askCloudStart() bool {
+	if u.cloudTurn != nil || !u.warm {
+		return false
+	}
+	if e := u.agent.CloudApprovalNeeded(); e != "" {
+		u.askCloudTurn(&cloudTurn{endpoint: e})
+		return true
+	}
+	return false
+}
+
+// startTurn sends a message, after asking if the active model is a cloud
+// one this session has not approved yet.
 func (u *UI) startTurn(text string) {
+	if e := u.agent.CloudApprovalNeeded(); e != "" {
+		u.askCloudTurn(&cloudTurn{endpoint: e, text: text})
+		return
+	}
 	u.runBusy("turn", func(ctx context.Context) error { return u.agent.RunTurn(ctx, text) })
+}
+
+// sendTurn runs an approved held message, or the held /retry.
+func (u *UI) sendTurn(text string, retry bool) {
+	if retry {
+		t, err := u.agent.Undo()
+		if err != nil {
+			u.warnf("%v", err)
+			u.promptLine()
+			return
+		}
+		u.infof("resending: %s", textutil.OneLine(t, 80))
+		text = t
+	}
+	u.startTurn(text)
 }
 
 func (u *UI) runBusy(kind string, fn func(context.Context) error) {
@@ -797,9 +1008,126 @@ func (u *UI) finishBusy(err error) {
 			u.infof("/retry resends your last message")
 		}
 	}
+	if name := u.nextModel; name != "" {
+		ok := u.nextOK
+		u.nextModel, u.nextOK = "", ""
+		if errors.Is(err, context.Canceled) {
+			u.infof("the switch to %s was dropped with the cancelled operation", name)
+		} else {
+			u.startSwitch(name, ok) // queued messages wait until the switch is done
+			return
+		}
+	}
 	if !u.startNextQueued() {
 		u.promptLine()
 	}
+}
+
+// model lists the profiles and models, or switches to one. A switch typed
+// while the agent works is applied when the current operation ends.
+func (u *UI) model(args []string) {
+	if len(args) == 0 {
+		ctx, cancel := context.WithTimeout(u.ctx, 20*time.Second)
+		defer cancel()
+		u.block(u.agent.ModelList(ctx))
+		return
+	}
+	if strings.EqualFold(args[0], "--online") {
+		all, filter := false, ""
+		for _, a := range args[1:] {
+			if a == "--all" {
+				all = true
+			} else {
+				filter = a
+			}
+		}
+		ctx, cancel := context.WithTimeout(u.ctx, 30*time.Second)
+		defer cancel()
+		u.block(u.agent.OnlineList(ctx, filter, all))
+		return
+	}
+	if len(args) > 1 {
+		u.warnf("usage: /model [profile or model | --online [filter] [--all]]")
+		return
+	}
+	name := args[0]
+	if _, endpoint := u.agent.CloudTarget(name); endpoint != "" && !u.agent.CloudApproved(endpoint) && u.warm && !u.agent.Rogue() {
+		u.cloudModel = name
+		u.warnf("%s runs on %s: from now on this conversation, including the file contents and command output in it, is sent there. Switch? [y/N]", name, endpoint)
+		return
+	}
+	u.switchTo(name)
+}
+
+// switchTo switches models now, or when the current operation ends.
+func (u *UI) switchTo(name string) { u.switchToApproved(name, "") }
+
+// switchToApproved is switchTo with the cloud endpoint the operator just
+// approved; the approval is recorded only if the switch succeeds.
+func (u *UI) switchToApproved(name, endpoint string) {
+	switch {
+	case !u.warm:
+		u.warnf("the model is still loading; switch once it is ready")
+	case u.agent.Rogue():
+		u.warnf("rogue mode stays on the model it started with; turn it off first (/rogue off)")
+	case u.busy:
+		u.nextModel, u.nextOK = name, endpoint
+		u.infof("switching to %s when the current operation ends", name)
+	default:
+		u.startSwitch(name, endpoint)
+	}
+}
+
+// adapt lists adapted models, measures one, or pins or forgets a value.
+func (u *UI) adapt(args []string) {
+	if len(args) == 0 {
+		u.block(u.agent.AdaptReport())
+		return
+	}
+	name, rest := args[0], args[1:]
+	ctx, cancel := context.WithTimeout(u.ctx, 20*time.Second)
+	defer cancel()
+	switch {
+	case len(rest) == 2 && strings.EqualFold(rest[0], "set"):
+		n, err := strconv.Atoi(rest[1])
+		if err != nil {
+			u.warnf("usage: /adapt <name> set <tokens>")
+			return
+		}
+		if err := u.agent.AdaptSet(ctx, name, n); err != nil {
+			u.warnf("%v", err)
+		}
+	case len(rest) == 1 && strings.EqualFold(rest[0], "forget"):
+		if err := u.agent.AdaptForget(ctx, name); err != nil {
+			u.warnf("%v", err)
+		}
+	case len(rest) == 0 || (len(rest) == 1 && rest[0] == "--verify"):
+		switch {
+		case !u.warm:
+			u.warnf("the model is still loading; run /adapt once it is ready")
+		case u.agent.Rogue():
+			u.warnf("not in rogue mode: /adapt takes the GPU away from the model for minutes")
+		default:
+			verify := len(rest) == 1
+			u.runBusy("adapt", func(ctx context.Context) error {
+				return u.agent.AdaptModel(ctx, name, verify, u.opt.BuildPrompts)
+			})
+		}
+	default:
+		u.warnf("usage: /adapt [<name> [--verify] | <name> set <tokens> | <name> forget]")
+	}
+}
+
+// startSwitch runs a switch; approved is the cloud endpoint the operator
+// agreed to, recorded only if the switch lands on it.
+func (u *UI) startSwitch(name, approved string) {
+	u.runBusy("model", func(ctx context.Context) error {
+		err := u.agent.SwitchModel(ctx, name, u.opt.BuildPrompts)
+		if err == nil && approved != "" && u.agent.Models.Active().Endpoint == approved {
+			u.agent.ApproveCloud(approved)
+		}
+		return err
+	})
 }
 
 func (u *UI) startNextQueued() bool {
@@ -1074,10 +1402,19 @@ func (u *UI) stopWaiting() {
 }
 
 func (u *UI) promptString() string {
-	cfg := u.opt.Deps.Cfg
+	think := "think " + onOff(u.agent.Think())
+	if !u.agent.ThinkAvailable() {
+		think = "think n/a"
+	}
 	parts := []string{
-		fmt.Sprintf("ctx %s/%s", textutil.KTok(u.agent.UsedTokens()), textutil.KTok(cfg.NumCtx)),
-		"think " + onOff(u.agent.Think()),
+		fmt.Sprintf("ctx %s/%s", textutil.KTok(u.agent.UsedTokens()), textutil.KTok(u.agent.Window())),
+		think,
+	}
+	if u.agent.ChatOnly() {
+		parts = append(parts, "chat only")
+	}
+	if c := u.agent.Model().Cloud; c != "" {
+		parts = append(parts, "cloud: "+c)
 	}
 	if s := u.opt.Deps.Guard.Status(); s != "" {
 		parts = append(parts, s)
@@ -1114,12 +1451,22 @@ func (u *UI) banner() {
 			where = fmt.Sprintf("%s (shared %s: %s)", ws.Root, ws.Share, ws.Access)
 		}
 	}
-	u.line(u.style(cBold, "Clauzette - Flush your thoughts.") + u.style(cDim, fmt.Sprintf(" · %s @ %s · workspace %s", cfg.Model, cfg.OllamaURL, where)))
+	act := u.agent.Model()
+	model := act.Model
+	if act.Profile != config.ImplicitProfile && act.Profile != act.Model {
+		model = fmt.Sprintf("%s (profile %s)", act.Model, act.Profile)
+	}
+	server := cfg.OllamaURL
+	if act.Cloud != "" {
+		model += " on " + act.Cloud
+		_, pc := cfg.ProviderFor(act.Source())
+		server = pc.BaseURL
+	}
+	u.line(u.style(cBold, "Clauzette - Flush your thoughts.") + u.style(cDim, fmt.Sprintf(" · %s @ %s · workspace %s", model, server, where)))
+	u.ensureChatPrompt()
 	if u.opt.Resumed {
 		u.infof("resumed session %s: %d messages in context", s.ID, len(s.Context))
-		if s.Model != "" && s.Model != cfg.Model {
-			u.warnf("this session was started with %s; continuing with %s", s.Model, cfg.Model)
-		}
+		u.warnModelChange(s)
 		u.showLastReply(s)
 	} else {
 		u.infof("new session %s", s.ID)
@@ -1156,8 +1503,20 @@ While idle:
                     summarise that share of the oldest conversation this once
   /undo  /retry     drop the last exchange (and resend it)
   /sessions  /new  /load <id>
-  /system-prompt [reload]  show the system prompt in use, or rebuild both
-                    (normal and rogue mode)
+  /clear            discard this session's conversation and start a new one
+                    (files and safe-mode backups are kept; asks first)
+  /model [name]     list profiles and installed models, or switch to a profile
+                    or model (also mid-task: then it waits for the task to end;
+                    not in rogue mode). A cloud model is provider:model, e.g.
+                    openrouter:vendor/model:free; the first switch to a cloud
+                    provider in a session asks first
+  /model --online [filter] [--all]  OpenRouter's free models (--all: paid too)
+  /adapt [name [--verify]]  list adapted models, or find the largest context
+                    that keeps a model fully on the GPU (unloads all models,
+                    takes minutes; --verify also runs one near-full request)
+  /adapt <name> set <tokens> | forget   pin or drop a model's value
+  /system-prompt [reload]  show the system prompt in use, or rebuild all three
+                    (normal, rogue mode, chat-only)
   /gpu              GPU guard status
   /approvals [reset]
   /safe [restore <n> [force]]  safe mode status and backups, restore a backup

@@ -8,31 +8,43 @@
   "show_thinking": false,
   "warmup_prefill": false,
 
+  "profiles": [],
+  "providers": {},
+  "default_profile": "",
+
   "workspace": "/workspace",
   "agent_id": "",
   "agent_dir": false,
   "shared_access": "read",
   "sessions_dir": "/state/sessions",
   "audit_log": "/state/audit.jsonl",
+  "models_file": "/state/models.json",
   "color": "auto",
 
   "prompt": {
     "base_file": "",
     "rogue_base_file": "",
+    "chat_base_file": "",
     "extra_file": "",
     "project_files": ["AGENTS.md", "CLAUDE.md"],
     "project_max_bytes": 20000,
     "internet_access": false
   },
   "context": {
-    "compact_at_tokens": 100000,
-    "compact_target_tokens": 40000,
-    "keep_recent_tokens": 20000,
+    "compact_at_fraction": 0.75,
+    "compact_target_fraction": 0.30,
+    "keep_recent_fraction": 0.15,
+    "summary_chunk_fraction": 0.46,
+    "reserve_fraction": 0.0625,
+    "reserve_thinking_fraction": 0.1875,
+    "compact_at_tokens": 0,
+    "compact_target_tokens": 0,
+    "keep_recent_tokens": 0,
     "keep_recent_ratio": 0,
     "reserve_tokens": 8192,
     "reserve_tokens_thinking": 24576,
     "elide_tool_results_over_chars": 600,
-    "summary_chunk_tokens": 60000
+    "summary_chunk_tokens": 0
   },
   "timeouts": {
     "connect_seconds": 5,
@@ -84,6 +96,10 @@
     "util_window_seconds": 60,
     "util_pause_seconds": 60,
     "sample_seconds": 5,
-    "max_pause_seconds": 900
+    "max_pause_seconds": 900,
+    "mem_used_metric": "DCGM_FI_DEV_FB_USED",
+    "mem_total_metric": "",
+    "mem_free_metric": "DCGM_FI_DEV_FB_FREE",
+    "mem_scale": 1048576
   }
 }

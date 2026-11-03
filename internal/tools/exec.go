@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -92,7 +91,7 @@ var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 func (t *ExecCommand) run(ctx context.Context, command, dir string, timeout time.Duration) (string, error) {
 	cmd := exec.Command(t.Shell, "-c", command)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
+	cmd.Env = childEnv(
 		"PAGER=cat", "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0",
 		"TERM=dumb", "NO_COLOR=1", "CI=1", "DEBIAN_FRONTEND=noninteractive")
 	out := newCappedBuffer(t.MaxOutput)
