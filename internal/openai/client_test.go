@@ -181,6 +181,42 @@ func TestRequestMapping(t *testing.T) {
 	}
 }
 
+func TestImageParts(t *testing.T) {
+	f := &fakeProvider{reply: func(w io.Writer) { sse(w, `{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}`) }}
+	c := newTestClient(t, f, Options{APIKey: "k"})
+	_, err := c.ChatStream(context.Background(), llm.ChatRequest{
+		Model: "free/tooly:free",
+		Messages: []llm.Message{
+			{Role: "system", Content: "S"},
+			{Role: "user", Content: "What is this?", Images: []string{"QUJD"},
+				ImageRefs: []llm.Image{{Path: "shot.png", MIME: "image/png", SHA256: "x"}}},
+			{Role: "user", Content: "plain"},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := f.requests[0]["messages"].([]any)
+	parts, ok := msgs[1].(map[string]any)["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("content of a message with an image: %v", msgs[1])
+	}
+	text, img := parts[0].(map[string]any), parts[1].(map[string]any)
+	if text["type"] != "text" || text["text"] != "What is this?" {
+		t.Fatalf("text part %v", text)
+	}
+	if img["type"] != "image_url" || img["image_url"].(map[string]any)["url"] != "data:image/png;base64,QUJD" {
+		t.Fatalf("image part %v", img)
+	}
+	if msgs[2].(map[string]any)["content"] != "plain" {
+		t.Fatalf("a message without images must stay a string: %v", msgs[2])
+	}
+	b, _ := json.Marshal(f.requests[0])
+	if strings.Contains(string(b), "shot.png") || strings.Contains(string(b), "image_refs") {
+		t.Fatal("image references (local paths) were sent to the provider")
+	}
+}
+
 func TestCatalog(t *testing.T) {
 	c := newTestClient(t, &fakeProvider{}, Options{})
 	list, err := c.ListModels(context.Background())

@@ -28,6 +28,7 @@ const (
 	KindCancelled   = "cancelled"   // tool call that never ran
 	KindNote        = "note"        // transcript-only remark, never sent to the model
 	KindHarness     = "harness"     // message the harness wrote in the user role (plan mode notes and results)
+	KindImage       = "image"       // images the model asked to see (view_image), in the user role after the tool results
 )
 
 // PendingCall is a tool call captured in plan mode. Only the call is kept,
@@ -62,7 +63,8 @@ type Entry struct {
 //	1 (or missing): before profiles; had chars_per_token (now ignored on load,
 //	  the estimate lives in the models file)
 //	2: profile, system_chat, tool call ids, the model on each reply
-const FormatVersion = 2
+//	3: image_refs on messages (the images are kept in ImageDir)
+const FormatVersion = 3
 
 type Session struct {
 	FormatVersion int       `json:"format_version"`
@@ -126,6 +128,11 @@ func NewID() string {
 
 type Store struct {
 	Dir string
+	// TakeOver lets Lock take a session whose lock was written on another
+	// host. In a pod that is the previous pod (a new pod has a new host
+	// name, and the state volume is used by one pod at a time), whose
+	// process cannot be checked from here.
+	TakeOver bool
 	// Fallback is an older directory that Load also looks in, read-only:
 	// sessions saved before per-agent directories still resume (and are
 	// saved to Dir from then on).
@@ -197,6 +204,10 @@ func (st *Store) Delete(id string) error {
 	return nil
 }
 
+// ImageDir is where attached images are kept, by content hash, shared by
+// all of this agent's sessions.
+func (st *Store) ImageDir() string { return filepath.Join(st.Dir, "images") }
+
 // BackupDir is where a session's safe-mode backups are kept.
 func (st *Store) BackupDir(id string) string { return filepath.Join(st.Dir, "backups", id) }
 
@@ -238,13 +249,16 @@ func (st *Store) List() ([]Info, error) {
 }
 
 // Latest returns the id of the most recently updated session.
+// ErrNoSessions is returned by Latest when nothing has been saved yet.
+var ErrNoSessions = errors.New("no saved sessions")
+
 func (st *Store) Latest() (string, error) {
 	list, err := st.List()
 	if err != nil {
 		return "", err
 	}
 	if len(list) == 0 {
-		return "", fmt.Errorf("no saved sessions in %s", st.Dir)
+		return "", fmt.Errorf("%w in %s", ErrNoSessions, st.Dir)
 	}
 	return list[0].ID, nil
 }

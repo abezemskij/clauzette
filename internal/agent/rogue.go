@@ -174,10 +174,14 @@ func (a *Agent) toolSpecs() []ollama.ToolSpec {
 	if a.ChatOnly() {
 		return nil
 	}
+	specs := a.specs
 	if a.rogue.Load() {
-		return a.rogueSpecs
+		specs = a.rogueSpecs
 	}
-	return a.specs
+	if !a.Vision() {
+		specs = withoutVision(specs)
+	}
+	return specs
 }
 
 // fixed is the size of the system prompt and tool definitions now.

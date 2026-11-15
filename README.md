@@ -14,6 +14,8 @@ Pure Go standard library, no external dependencies. Linux only.
 - **Safe workspace access.** File tools are confined to the workspace through `os.Root`, never overwrite files changed by someone else, and handle symlinks safely. Several agents can share one workspace, each in its own directory.
 - **Beyond the workspace.** Web search through a SearXNG instance, URL fetch with a per-host allowlist (HTML comes back as readable text with scripts and markup stripped and links kept as a numbered reference list), read-only git (status, diff, log), an IP-to-country lookup, and a todo list the model keeps for itself on longer tasks.
 - **Modes.** *Safe mode* backs up before moves and deletes. *Plan mode* collects changes for review before anything runs. *Rogue mode* works unattended until the task is done, within a step budget and a time limit.
+- **Images.** With a vision model, `/image` sends a screenshot, chart or photo with your question, and the agent can look at images in the workspace on its own (`view_image`), for example a plot it just rendered.
+- **Readable replies.** Markdown is rendered while it streams: headings, bold, code and code blocks, lists, quotes and links.
 - **Long sessions.** Automatic compaction (fixed size or a proportion of the conversation), sessions saved after every step and resumable after a restart, and a complete transcript that is never shortened.
 - **Made for local models.** Stable prompts for Ollama's prompt cache, phased timeouts for slow model loads, a GPU temperature guard, and an audit log of every tool call.
 
@@ -36,6 +38,8 @@ make build && mkdir -p scratch
 ./bin/clauzette -config clauzette.local.json -resume
 ```
 
+**As a server:** `clauzette serve` keeps the session running in the background and `clauzette attach` connects a terminal to it, from as many terminals as you like, or from its web page in a browser; detaching does not stop the work. See [Server mode](DETAILS.md#server-mode-serve-and-attach).
+
 Locally, commands run as your own user with your credentials in reach; read the notes in [Running locally](DETAILS.md#running-locally) first.
 
 ## Everyday commands
@@ -46,6 +50,7 @@ Locally, commands run as your own user with your credentials in reach; read the 
 | `!think`, `!safe`, `!plan` `[on\|off]` | Thinking, safe mode, plan mode |
 | `/context`, `/compact [percent]` | Context usage; compact now |
 | `/undo`, `/retry` | Drop the last exchange (and resend it) |
+| `/image <path> [question]` | Send an image with a question (needs a model with vision) |
 | `/sessions`, `/new`, `/load <id>` | Manage sessions |
 | `/clear` | Discard this session's conversation and start fresh (files kept) |
 | `/model [name]` | List models and profiles; switch between them |

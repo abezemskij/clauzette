@@ -196,3 +196,86 @@ func TestFetchRedirectAllowlist(t *testing.T) {
 		t.Fatalf("cross-host redirect should be refused with an allowlist error, got %v", err)
 	}
 }
+
+func TestFetchContentKinds(t *testing.T) {
+	page := "<!DOCTYPE html><html><head><script>var x=1;</script></head><body><p>Hello <b>world</b></p></body></html>"
+	pdf := append([]byte("%PDF-1.7\n"), make([]byte, 64)...)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/page":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, page)
+		case "/mislabelled":
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, page)
+		case "/doc.pdf":
+			w.Header().Set("Content-Type", "application/pdf")
+			w.Write(pdf)
+		case "/blob":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Write([]byte{0x7f, 'E', 'L', 'F', 0, 0, 1, 2, 3})
+		case "/notes.txt":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			fmt.Fprint(w, "plain notes served as octet-stream")
+		case "/fake-html":
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte{'<', 'p', '>', 0, 0, 0xff, 0xfe})
+		case "/shot.png":
+			w.Header().Set("Content-Type", "image/png")
+			w.Write([]byte("\x89PNG\r\n\x1a\n"))
+		case "/icon.svg":
+			w.Header().Set("Content-Type", "image/svg+xml")
+			fmt.Fprint(w, `<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>`)
+		}
+	}))
+	defer srv.Close()
+	f := &FetchURL{AllowHTTP: true, AllowPrivate: true}
+	get := func(p string, raw bool) string {
+		t.Helper()
+		act, err := f.Prepare(context.Background(), Args{"url": srv.URL + p, "raw": raw})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if raw != strings.Contains(act.Summary, ", raw") {
+			t.Fatalf("summary %q", act.Summary)
+		}
+		out, err := act.Run(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	if out := get("/page", false); !strings.Contains(out, "Hello world") || strings.Contains(out, "<b>") || strings.Contains(out, "var x") {
+		t.Errorf("HTML not converted:\n%s", out)
+	}
+	if out := get("/page", true); !strings.Contains(out, "<b>world</b>") || !strings.Contains(out, "<script>var x=1;</script>") || !strings.Contains(out, "(raw:") {
+		t.Errorf("raw did not return the source:\n%s", out)
+	}
+	if out := get("/mislabelled", false); !strings.Contains(out, "Hello world") || strings.Contains(out, "<b>") || !strings.Contains(out, "the body is HTML") {
+		t.Errorf("HTML labelled text/plain not converted:\n%s", out)
+	}
+	if out := get("/mislabelled", true); !strings.Contains(out, "<b>world</b>") {
+		t.Errorf("raw converted a mislabelled page:\n%s", out)
+	}
+	for _, p := range []string{"/doc.pdf", "/blob", "/fake-html", "/shot.png"} {
+		for _, raw := range []bool{false, true} {
+			out := get(p, raw)
+			if !strings.Contains(out, "Binary content") || strings.Contains(out, "PDF-1.7") || strings.Contains(out, "\x00") || strings.Contains(out, "ELF") {
+				t.Errorf("%s (raw %v) returned binary bytes:\n%q", p, raw, out)
+			}
+		}
+	}
+	if out := get("/doc.pdf", false); !strings.Contains(out, "application/pdf, 73 B") || !strings.Contains(out, "curl -fsSL -o doc.pdf '"+srv.URL+"/doc.pdf'") {
+		t.Errorf("binary note:\n%s", out)
+	}
+	if out := get("/shot.png", false); !strings.Contains(out, "view_image") {
+		t.Errorf("image note does not mention view_image:\n%s", out)
+	}
+	if out := get("/notes.txt", false); !strings.Contains(out, "plain notes served as octet-stream") {
+		t.Errorf("text served as octet-stream was refused:\n%s", out)
+	}
+	if out := get("/icon.svg", false); !strings.Contains(out, "<circle") {
+		t.Errorf("SVG (text) was refused:\n%s", out)
+	}
+}

@@ -56,6 +56,23 @@ func HideEnv(names ...string) {
 	secretValues.Store(&vals)
 }
 
+// HideValue adds a secret that is not in an environment variable (the
+// server token read from a file) to what Redact replaces.
+func HideValue(name, value string) {
+	if len(value) < minSecretLen {
+		return
+	}
+	old := secretValues.Load()
+	vals := map[string]string{}
+	if old != nil {
+		for k, v := range *old {
+			vals[k] = v
+		}
+	}
+	vals[value] = name
+	secretValues.Store(&vals)
+}
+
 // Redact replaces the values of the hidden variables in s with
 // "[redacted NAME]". Tool output goes through it before it reaches the
 // conversation, the session file and the audit log, so a key that a command

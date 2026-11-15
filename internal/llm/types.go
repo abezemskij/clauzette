@@ -36,6 +36,26 @@ type Message struct {
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolName   string     `json:"tool_name,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"` // on a tool result: the ToolCall.ID it answers
+
+	// ImageRefs are the images attached to this message (user messages
+	// only). The session stores these references, never the image data.
+	ImageRefs []Image `json:"image_refs,omitempty"`
+	// Images is the data of ImageRefs, base64-encoded, in the same order.
+	// It is filled in on the copy of a message that goes into a request
+	// (Ollama reads this field as it is) and is never saved.
+	Images []string `json:"images,omitempty"`
+}
+
+// Image is an image attached to a message. The data is kept by the
+// agent's image store under its SHA-256, so a session refers to the exact
+// bytes the model saw even if the original file changes or is deleted.
+type Image struct {
+	Path   string `json:"path"` // where it came from, for display
+	MIME   string `json:"mime"` // image/png, image/jpeg, image/webp, image/gif
+	SHA256 string `json:"sha256"`
+	Width  int    `json:"width,omitempty"`
+	Height int    `json:"height,omitempty"`
+	Bytes  int64  `json:"bytes"`
 }
 
 type FunctionSpec struct {

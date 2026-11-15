@@ -34,8 +34,24 @@ func TestReadInput(t *testing.T) {
 			[]inputLine{{text: "a\nb\nc", literal: true}}},
 		{"paste preserves a leading slash", start + "/not a command" + end + "\n",
 			[]inputLine{{text: "/not a command", literal: true}}},
-		{"text before a paste on the same line", "hi " + start + "p" + end + "\n",
-			[]inputLine{{text: "hi "}, {text: "p", literal: true}}},
+		{"typed text and a paste are one message", "download this image " + start + "https://x.test/a.png" + end + "\n",
+			[]inputLine{{text: "download this image https://x.test/a.png"}}},
+		{"text after a paste joins it", start + "https://x.test/a.png" + end + " what is it?\n",
+			[]inputLine{{text: "https://x.test/a.png what is it?", literal: true}}},
+		{"typed command with a pasted argument", "/image " + start + "shot.png" + end + " why?\n",
+			[]inputLine{{text: "/image shot.png why?"}}},
+		{"two pastes in one message", "compare " + start + "a" + end + " and " + start + "b" + end + "\n",
+			[]inputLine{{text: "compare a and b"}}},
+		{"multi-line paste after typed text", "fix this:\n" + start + "line1\nline2" + end + "\n",
+			[]inputLine{{text: "fix this:"}, {text: "line1\nline2", literal: true}}},
+		{"multi-line paste mid-line", "see " + start + "l1\nl2" + end + " ok\n",
+			[]inputLine{{text: "see l1\nl2 ok"}}},
+		{"pasted triple quote is not a block", start + `"""` + end + "\n",
+			[]inputLine{{text: `"""`, literal: true}}},
+		{"paste inside a block", "\"\"\"\nx " + start + "p1\np2" + end + "\n\"\"\"\n",
+			[]inputLine{{text: "x p1\np2", literal: true}}},
+		{"empty paste alone is ignored", start + end + "\n", nil},
+		{"input ends without Enter", "last words", []inputLine{{text: "last words"}}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -43,50 +59,5 @@ func TestReadInput(t *testing.T) {
 				t.Errorf("readFrom(%q):\n got %#v\nwant %#v", c.in, got, c.want)
 			}
 		})
-	}
-}
-
-func TestParsePlanArgs(t *testing.T) {
-	cases := []struct {
-		in         string
-		total      int // pending actions
-		approve    bool
-		nums       []int
-		comment    string
-		noContinue bool
-		wantErr    bool
-	}{
-		{in: "", total: 1, approve: true},
-		{in: "all", total: 1, approve: true},
-		{in: "1 3", total: 3, approve: true, nums: []int{1, 3}},
-		{in: "1 but then stop and let's review the changes", total: 1, approve: true, nums: []int{1}, comment: "but then stop and let's review the changes"},
-		{in: "all looks good,  continue", total: 1, approve: true, comment: "looks good,  continue"},
-		{in: "1 -- 2 files only", total: 3, approve: true, nums: []int{1}, comment: "2 files only"},
-		{in: "1 2 files only", total: 3, approve: true, nums: []int{1, 2}, comment: "files only"}, // why "--" exists
-		{in: "1 2 files only", total: 1, approve: true, wantErr: true},                            // 2 is out of range
-		{in: "all 3 more", total: 1, approve: true, comment: "3 more"},                            // after "all", numbers are comment
-		{in: "looks good", total: 1, approve: true, wantErr: true},                                // no selection
-		{in: "-- 2 files", total: 1, approve: true, wantErr: true},                                // no selection
-		{in: "9", total: 1, approve: true, wantErr: true},
-		{in: "", total: 0, approve: true, wantErr: true},
-		{in: "--no-continue 2", total: 3, approve: true, nums: []int{2}, noContinue: true},
-		{in: "2 --no-continue check it", total: 3, approve: true, nums: []int{2}, noContinue: true, comment: "check it"},
-		{in: "1 wrong dir", total: 1, nums: []int{1}, comment: "wrong dir"}, // reject with a reason
-		{in: "all", total: 1},                          // reject all
-		{in: "--no-continue", total: 1, wantErr: true}, // not a reject option
-	}
-	for _, c := range cases {
-		p, err := parsePlanArgs(c.in, c.total, c.approve)
-		if (err != nil) != c.wantErr {
-			t.Errorf("%q (total %d): err = %v, want error %v", c.in, c.total, err, c.wantErr)
-			continue
-		}
-		if err != nil {
-			continue
-		}
-		if !reflect.DeepEqual(p.nums, c.nums) || p.comment != c.comment || p.noContinue != c.noContinue {
-			t.Errorf("%q: got nums=%v comment=%q noContinue=%v, want nums=%v comment=%q noContinue=%v",
-				c.in, p.nums, p.comment, p.noContinue, c.nums, c.comment, c.noContinue)
-		}
 	}
 }

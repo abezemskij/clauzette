@@ -5,14 +5,18 @@
 //	clauzette -session ID   continue a specific session
 //	clauzette -profile P    use model profile P (default: the session's, else default_profile)
 //	clauzette -sessions     list saved sessions
+//	clauzette serve [flags] run the session in a server (same flags); clients attach to it
+//	clauzette attach        attach this terminal to a running server (-server URL)
 //	clauzette idle          keep a container running (pod entrypoint)
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -23,10 +27,12 @@ import (
 	"clauzette/internal/gpu"
 	"clauzette/internal/modeldb"
 	"clauzette/internal/ollama"
+	"clauzette/internal/server"
 	"clauzette/internal/session"
 	"clauzette/internal/textutil"
 	"clauzette/internal/tools"
 	"clauzette/internal/ui"
+	"clauzette/internal/wire"
 )
 
 var version = "dev"
@@ -42,6 +48,10 @@ func main() {
 		idle()
 		return
 	}
+	mode, args := "terminal", os.Args[1:]
+	if len(args) > 0 && (args[0] == "serve" || args[0] == "attach") {
+		mode, args = args[0], args[1:]
+	}
 	cfgFlag := flag.String("config", "", "config file (default: $CLAUZETTE_CONFIG, ./clauzette.json or /etc/clauzette/config.json)")
 	resume := flag.Bool("resume", false, "resume the most recent session")
 	sessionID := flag.String("session", "", "resume the session with this id")
@@ -49,19 +59,27 @@ func main() {
 	list := flag.Bool("sessions", false, "list saved sessions and exit")
 	printCfg := flag.Bool("print-config", false, "print the effective configuration and exit")
 	showVersion := flag.Bool("version", false, "print the version and exit")
-	flag.Parse()
+	serverURL := flag.String("server", "", "attach: the server's URL (default: $CLAUZETTE_SERVER, else http://<server.listen>)")
+	takeOver := flag.Bool("take-over", false, "take the session even if another host holds its lock (in a pod: the previous pod)")
+	flag.CommandLine.Parse(args)
 
 	if *showVersion {
 		fmt.Println("clauzette", version)
 		return
 	}
-	if err := run(*cfgFlag, *resume, *sessionID, *profile, *list, *printCfg); err != nil {
+	var err error
+	if mode == "attach" {
+		err = attach(*cfgFlag, *serverURL)
+	} else {
+		err = run(mode, *cfgFlag, *resume, *sessionID, *profile, *list, *printCfg, *takeOver)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "clauzette:", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfgFlag string, resume bool, sessionID, profileFlag string, list, printCfg bool) error {
+func run(mode, cfgFlag string, resume bool, sessionID, profileFlag string, list, printCfg, takeOver bool) error {
 	cfg, err := config.Load(config.ResolvePath(cfgFlag))
 	if err != nil {
 		return err
@@ -78,6 +96,7 @@ func run(cfgFlag string, resume bool, sessionID, profileFlag string, list, print
 	if cfg.AgentDir {
 		store.Fallback = cfg.SessionsDir // sessions saved before per-agent directories
 	}
+	store.TakeOver = takeOver
 	if list {
 		return listSessions(store)
 	}
@@ -98,7 +117,8 @@ func run(cfgFlag string, resume bool, sessionID, profileFlag string, list, print
 	defer ws.Close()
 	todos := tools.NewTodoList()
 	fetchPolicy := tools.NewFetchPolicy(cfg.Tools.FetchAllowlist, cfg.Tools.FetchAllowedHosts)
-	reg := buildRegistry(cfg, ws, todos, fetchPolicy)
+	images := tools.NewImageStore(store.ImageDir(), cfg.Tools.ImageMaxBytes)
+	reg := buildRegistry(cfg, ws, todos, fetchPolicy, images)
 	client := ollama.New(cfg.OllamaURL, ollama.Timeouts{
 		Connect:    secs(cfg.Timeouts.ConnectSeconds),
 		FirstToken: secs(cfg.Timeouts.FirstTokenSeconds),
@@ -133,8 +153,11 @@ func run(cfgFlag string, resume bool, sessionID, profileFlag string, list, print
 		var id string
 		if id, err = store.Latest(); err == nil {
 			sess, err = store.Load(id)
+			resumed = true
+		} else if errors.Is(err, session.ErrNoSessions) {
+			err = nil // nothing to resume yet (a new state volume): start a new session
+			notes = append(notes, "no saved session to resume; started a new one")
 		}
-		resumed = true
 	}
 	if err != nil {
 		return err
@@ -150,7 +173,7 @@ func run(cfgFlag string, resume bool, sessionID, profileFlag string, list, print
 	}
 	models := agent.NewModels(cfg, db, profile)
 
-	deps := agent.Deps{Cfg: cfg, Client: client, Models: models, Registry: reg, Store: store, Guard: guard, GPUMem: gpu.NewMemory(cfg.GPU), Audit: audit, WS: ws, Todos: todos, Fetch: fetchPolicy}
+	deps := agent.Deps{Cfg: cfg, Client: client, Models: models, Registry: reg, Store: store, Guard: guard, GPUMem: gpu.NewMemory(cfg.GPU), Audit: audit, WS: ws, Todos: todos, Fetch: fetchPolicy, Images: images}
 	// buildPrompts assembles the three system prompts (normal, rogue mode,
 	// and chat-only for a model without tools), so a session can switch
 	// without rebuilding.
@@ -216,14 +239,23 @@ func run(cfgFlag string, resume bool, sessionID, profileFlag string, list, print
 		notes = append(notes, n...)
 	}
 
-	u := ui.New(ui.Options{
+	unlock, err := store.Lock(sess.ID)
+	if err != nil {
+		return err
+	}
+	defer unlock() // after an error; the controller releases it on a normal exit
+	opts := ui.Options{
 		Deps:         deps,
 		NewSession:   newSession,
 		BuildPrompts: buildPrompts,
 		Notes:        notes,
 		Resumed:      resumed,
-	}, sess)
-	return u.Run(ctx)
+		Unlock:       unlock,
+	}
+	if mode == "serve" {
+		return serve(ctx, cfg, opts, sess)
+	}
+	return ui.New(opts, sess).Run(ctx)
 }
 
 // shareFor is the shared workspace root for the prompt, "" when the agent
@@ -235,9 +267,9 @@ func shareFor(ws *tools.Workspace) string {
 	return ""
 }
 
-func buildRegistry(cfg *config.Config, ws *tools.Workspace, todos *tools.TodoList, fetchPolicy *tools.FetchPolicy) *tools.Registry {
+func buildRegistry(cfg *config.Config, ws *tools.Workspace, todos *tools.TodoList, fetchPolicy *tools.FetchPolicy, images *tools.ImageStore) *tools.Registry {
 	t := cfg.Tools
-	tools.HideEnv(cfg.KeyEnvNames()...) // API keys stay out of commands
+	tools.HideEnv(append(cfg.KeyEnvNames(), wire.TokenEnv)...) // API keys and the server token stay out of commands
 	all := []tools.Tool{
 		&tools.ReadFile{WS: ws, DefaultLines: t.ReadDefaultLines, MaxBytes: t.ReadMaxFileBytes},
 		&tools.ListDir{WS: ws},
@@ -267,6 +299,7 @@ func buildRegistry(cfg *config.Config, ws *tools.Workspace, todos *tools.TodoLis
 		},
 		&tools.TodoWrite{List: todos},
 		&tools.TodoRead{List: todos},
+		&tools.ViewImage{WS: ws, Store: images}, // offered only to a model with vision
 	}
 	if cfg.Search.Provider == "searxng" {
 		all = append(all, &tools.WebSearch{
@@ -315,3 +348,61 @@ func idle() {
 }
 
 func secs(n int) time.Duration { return time.Duration(n) * time.Second }
+
+// serve runs the session behind the HTTP API until SIGINT or SIGTERM.
+func serve(ctx context.Context, cfg *config.Config, opts ui.Options, sess *session.Session) error {
+	token, created, err := wire.EnsureToken(cfg.Server.TokenFile)
+	if err != nil {
+		return fmt.Errorf("server token: %w", err)
+	}
+	tools.HideValue("server token", token) // redacted wherever it turns up in tool output
+	if !wire.TokenFromEnv() {
+		fmt.Fprintf(os.Stderr, "clauzette serve: warning: the token is in a file, and commands the agent runs (as the same user) can read files; with it, a command could answer the agent's own approvals through the API. Set $%s instead (in Kubernetes: from a Secret); commands do not inherit it\n", wire.TokenEnv)
+	}
+	ln, err := net.Listen("tcp", cfg.Server.Listen)
+	if err != nil {
+		return err
+	}
+	if !server.IsLoopback(cfg.Server.Listen) {
+		fmt.Fprintf(os.Stderr, "clauzette serve: warning: %s accepts connections from other machines over plain HTTP, token included; prefer 127.0.0.1 with kubectl port-forward or an SSH tunnel, or put TLS in front\n", cfg.Server.Listen)
+	}
+	where := "token in " + cfg.Server.TokenFile
+	switch {
+	case wire.TokenFromEnv():
+		where = "token from $" + wire.TokenEnv
+	case created:
+		where = "new token written to " + cfg.Server.TokenFile
+	}
+	fmt.Fprintf(os.Stderr, "clauzette serve: session %s on http://%s (%s); clauzette attach connects\n", sess.ID, ln.Addr(), where)
+	sctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	srv := server.New(opts, sess, token)
+	srv.Web = cfg.Server.Web
+	srv.UploadMax = cfg.Server.UploadMaxBytes
+	if srv.Web {
+		fmt.Fprintf(os.Stderr, "clauzette serve: web page at http://%s/ (it asks for the token)\n", ln.Addr())
+	}
+	err = srv.Run(sctx, ln)
+	fmt.Fprintf(os.Stderr, "clauzette serve: stopped; session %s saved\n", sess.ID)
+	return err
+}
+
+// attach connects this terminal to a running server.
+func attach(cfgFlag, serverURL string) error {
+	cfg, err := config.Load(config.ResolvePath(cfgFlag))
+	if err != nil {
+		return err
+	}
+	base := serverURL
+	if base == "" {
+		base = os.Getenv("CLAUZETTE_SERVER")
+	}
+	if base == "" {
+		base = "http://" + cfg.Server.Listen
+	}
+	token, err := wire.LoadToken(cfg.Server.TokenFile)
+	if err != nil {
+		return err
+	}
+	return ui.NewRemote(cfg, &wire.Client{Base: base, Token: token}).RunRemote(context.Background())
+}

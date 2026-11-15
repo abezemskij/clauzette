@@ -38,6 +38,7 @@ type Deps struct {
 	WS       *tools.Workspace   // lets safe-mode restore mark restored files as read
 	Todos    *tools.TodoList    // the agent's task plan, shared with the todo tools
 	Fetch    *tools.FetchPolicy // the fetch_url allowlist, shared with the fetch tool
+	Images   *tools.ImageStore  // attached images, shared with the view_image tool; nil = no images
 }
 
 // Agent runs one session. RunTurn and Compact must not run concurrently;
@@ -306,8 +307,8 @@ func (a *Agent) buildMessages() []ollama.Message {
 	msgs = append(msgs, ollama.Message{Role: "system", Content: a.system()})
 	lastUser := -1
 	for i, e := range a.sess.Context {
-		if e.Role == "user" {
-			lastUser = i
+		if e.Role == "user" && e.Kind != session.KindImage {
+			lastUser = i // images the model asked for belong to the current turn
 		}
 	}
 	for i, e := range a.sess.Context {
@@ -336,12 +337,19 @@ func (a *Agent) RunHarnessTurn(ctx context.Context, text string) error {
 }
 
 func (a *Agent) runTurn(ctx context.Context, text, kind string) error {
+	return a.runTurnWith(ctx, text, kind, nil)
+}
+
+func (a *Agent) runTurnWith(ctx context.Context, text, kind string, images []llm.Image) error {
 	defer a.Save()
 	if a.sess.Title == "" && kind == "" {
 		a.sess.Title = textutil.OneLine(text, 60)
 	}
+	if a.Images != nil {
+		a.Images.Take() // left over from a step that never finished
+	}
 	a.flushNotes()
-	a.sess.Append(ollama.Message{Role: "user", Content: text}, kind)
+	a.sess.Append(ollama.Message{Role: "user", Content: text, ImageRefs: images}, kind)
 	a.Save()
 	if a.ChatOnly() {
 		// A session in rogue or plan mode resumed with a model without
@@ -441,10 +449,12 @@ func (a *Agent) runTurn(ctx context.Context, text, kind string) error {
 		for i, call := range res.Message.ToolCalls {
 			if ctx.Err() != nil {
 				a.cancelRemaining(res.Message.ToolCalls[i:])
+				a.takeToolImages()
 				return ctx.Err()
 			}
 			if timedOut() {
 				a.skipCalls(res.Message.ToolCalls[i:], "Not run: rogue mode's time limit was reached.")
+				a.takeToolImages()
 				return a.rogueFinal(ctx, rogueTimeLimit)
 			}
 			out := a.runTool(sctx, call)
@@ -454,6 +464,7 @@ func (a *Agent) runTurn(ctx context.Context, text, kind string) error {
 			a.sess.Append(ollama.Message{Role: "tool", ToolName: call.Function.Name, ToolCallID: call.ID, Content: out}, "")
 			a.Save()
 		}
+		a.takeToolImages()
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -505,7 +516,7 @@ func (a *Agent) skipCalls(calls []ollama.ToolCall, why string) {
 
 func (a *Agent) callModel(ctx context.Context, think bool) (*ollama.Result, error) {
 	act := a.Models.Active()
-	msgs := a.buildMessages()
+	msgs := a.attachImages(a.buildMessages())
 	req := ollama.ChatRequest{
 		Model:     act.Model,
 		Messages:  msgs,
@@ -761,11 +772,18 @@ func (a *Agent) Usage(res *ollama.Result) Usage {
 // Undo removes the last exchange (from the operator's last message to the
 // end) from the working context and returns that message.
 func (a *Agent) Undo() (string, error) {
+	in, err := a.UndoInput()
+	return in.Text, err
+}
+
+// UndoInput is Undo returning the removed message with its images, so
+// /retry can send it again as it was.
+func (a *Agent) UndoInput() (Input, error) {
 	ctxs := a.sess.Context
 	idx := -1
 	for i := len(ctxs) - 1; i >= 0; i-- {
 		if ctxs[i].Kind == session.KindSummary {
-			return "", errors.New("the last exchange has been compacted into a summary and can't be undone")
+			return Input{}, errors.New("the last exchange has been compacted into a summary and can't be undone")
 		}
 		if ctxs[i].Role == "user" && ctxs[i].Kind == "" {
 			idx = i
@@ -773,13 +791,13 @@ func (a *Agent) Undo() (string, error) {
 		}
 	}
 	if idx < 0 {
-		return "", errors.New("nothing to undo")
+		return Input{}, errors.New("nothing to undo")
 	}
-	text := ctxs[idx].Content
+	in := Input{Text: ctxs[idx].Content, Images: ctxs[idx].ImageRefs}
 	a.sess.Context = ctxs[:idx]
 	a.sess.Note("/undo removed the last exchange from the working context")
 	a.Save()
-	return text, nil
+	return in, nil
 }
 
 // summarizeArgs renders tool arguments compactly for display.

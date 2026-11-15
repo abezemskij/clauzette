@@ -22,8 +22,9 @@ import (
 // estimate, Ollama probably counted only the part that was not cached, and
 // the sample is ignored.
 
-func msgChars(m ollama.Message) int {
+func (a *Agent) msgChars(m ollama.Message) int {
 	n := len(m.Content) + len(m.Thinking) + len(m.ToolName) + len(m.ToolCallID) + 16
+	n += a.imagesChars(m.ImageRefs)
 	for _, tc := range m.ToolCalls {
 		b, _ := json.Marshal(tc)
 		n += len(b)
@@ -110,7 +111,7 @@ func (a *Agent) limits() limits {
 func (a *Agent) ContextTokens() int {
 	chars := a.fixed()
 	for _, m := range a.buildMessages()[1:] {
-		chars += msgChars(m)
+		chars += a.msgChars(m)
 	}
 	return a.tokens(chars)
 }
@@ -120,7 +121,7 @@ func (a *Agent) ContextTokens() int {
 func (a *Agent) entriesChars(entries []session.Entry) int {
 	n := 0
 	for _, e := range entries {
-		n += msgChars(e.Message)
+		n += a.msgChars(e.Message)
 	}
 	return n
 }
@@ -128,7 +129,7 @@ func (a *Agent) entriesChars(entries []session.Entry) int {
 func (a *Agent) entriesTokens(entries []session.Entry) int {
 	chars := a.fixed()
 	for _, e := range entries {
-		chars += msgChars(e.Message)
+		chars += a.msgChars(e.Message)
 	}
 	return a.tokens(chars)
 }
@@ -137,9 +138,14 @@ func (a *Agent) calibrate(sent []ollama.Message, res *ollama.Result) {
 	if res == nil || res.PromptEvalCount <= 0 || len(sent) == 0 {
 		return
 	}
+	for _, m := range sent {
+		if len(m.ImageRefs) > 0 {
+			return // image tokens are a guess; they would skew the text estimate
+		}
+	}
 	chars := a.fixed()
 	for _, m := range sent[1:] {
-		chars += msgChars(m)
+		chars += a.msgChars(m)
 	}
 	if float64(res.PromptEvalCount) < 0.5*float64(chars)/a.cpt {
 		return // probably only the uncached part was counted
@@ -301,7 +307,7 @@ func (a *Agent) findSplit(msgs []session.Entry, keepTokens int) int {
 	acc := 0
 	i := len(msgs)
 	for i > 0 {
-		t := a.tokens(msgChars(msgs[i-1].Message))
+		t := a.tokens(a.msgChars(msgs[i-1].Message))
 		if acc+t > keepTokens {
 			break
 		}
@@ -328,6 +334,10 @@ func elide(in []session.Entry, limit int) []session.Entry {
 	for i, e := range in {
 		m := e.Message
 		m.Thinking = ""
+		if len(m.ImageRefs) > 0 {
+			m.Content = strings.TrimSpace(m.Content + "\n\n" + imagesRemoved(m.ImageRefs))
+			m.ImageRefs = nil
+		}
 		if m.Role == "tool" && len(m.Content) > limit {
 			m.Content = fmt.Sprintf("[Output of %s removed during context compaction (%d characters); run the tool again if you need it. It began with: %s]",
 				m.ToolName, len(m.Content), textutil.OneLine(m.Content, 160))
@@ -438,6 +448,8 @@ func renderEntry(e session.Entry) string {
 		sb.WriteString("EARLIER SUMMARY:\n" + strings.TrimPrefix(e.Content, summaryPreamble) + "\n\n")
 	case e.Kind == session.KindAck:
 		// nothing worth keeping
+	case e.Kind == session.KindImage:
+		sb.WriteString("IMAGES SHOWN TO THE AGENT:\n" + e.Content + "\n\n")
 	case e.Role == "user":
 		sb.WriteString("OPERATOR:\n" + e.Content + "\n\n")
 	case e.Role == "assistant":
@@ -458,6 +470,7 @@ func renderEntry(e session.Entry) string {
 func (a *Agent) ContextReport() string {
 	type stat struct{ n, chars int }
 	stats := map[string]*stat{}
+	images, imageTokens := 0, 0
 	for _, m := range a.buildMessages()[1:] {
 		s := stats[m.Role]
 		if s == nil {
@@ -465,7 +478,11 @@ func (a *Agent) ContextReport() string {
 			stats[m.Role] = s
 		}
 		s.n++
-		s.chars += msgChars(m)
+		s.chars += a.msgChars(m)
+		images += len(m.ImageRefs)
+		for _, img := range m.ImageRefs {
+			imageTokens += a.imageTokens(img)
+		}
 	}
 	cc := a.Cfg.Context
 	act := a.Models.Active()
@@ -493,6 +510,10 @@ func (a *Agent) ContextReport() string {
 		if s := stats[role]; s != nil {
 			fmt.Fprintf(&sb, "  %-9s %4d message(s)          ~%s\n", role, s.n, textutil.KTok(a.tokens(s.chars)))
 		}
+	}
+	if images > 0 {
+		fmt.Fprintf(&sb, "  images    %4d                   ~%s (included above)%s\n", images, textutil.KTok(imageTokens),
+			map[bool]string{true: "", false: "; this model cannot see them, so they are not sent"}[act.Caps.Vision])
 	}
 	if r := cc.KeepRecentRatio; r > 0 {
 		fmt.Fprintf(&sb, "Compaction at ~%s keeps the newest %.0f%% of the conversation verbatim; the older part loses old tool output and is summarised unless that halves it. Compactions so far: %d.\n",

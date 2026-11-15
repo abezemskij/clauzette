@@ -123,9 +123,12 @@ func (c *Client) ShowModelContext(ctx context.Context, model string) (int, error
 // the returned Result holds whatever was received before the failure.
 func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onDelta func(Message)) (*Result, error) {
 	req.Stream = true
-	if req.Messages == nil {
-		req.Messages = []Message{}
+	msgs := make([]Message, len(req.Messages))
+	for i, m := range req.Messages {
+		m.ImageRefs = nil // Ollama reads the data in Images; the references stay local
+		msgs[i] = m
 	}
+	req.Messages = msgs
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err

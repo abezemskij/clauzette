@@ -65,3 +65,14 @@ func TestProtectProcessHidesEnviron(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestHideValue(t *testing.T) {
+	HideEnv()
+	HideValue("server token", "tok-0123456789abcdef")
+	HideValue("short", "abc") // too short to redact safely
+	got := Redact("curl -H 'Authorization: Bearer tok-0123456789abcdef' and abc")
+	if strings.Contains(got, "tok-0123456789abcdef") || !strings.Contains(got, "[redacted server token]") || !strings.Contains(got, "and abc") {
+		t.Fatalf("%q", got)
+	}
+	HideEnv()
+}

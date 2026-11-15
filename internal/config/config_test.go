@@ -107,3 +107,34 @@ func TestSearchValidation(t *testing.T) {
 		t.Fatal("unknown provider accepted")
 	}
 }
+
+func TestImageSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.json")
+	os.WriteFile(path, []byte(`{}`), 0o644)
+	c, err := Load(path)
+	if err != nil || c.Tools.ImageMaxBytes != 10<<20 || c.Tools.ImageTokens != 0 {
+		t.Fatalf("defaults: %+v %v", c.Tools, err)
+	}
+	os.WriteFile(path, []byte(`{"tools":{"image_max_bytes":5000000,"image_tokens":800}}`), 0o644)
+	if c, err = Load(path); err != nil || c.Tools.ImageMaxBytes != 5000000 || c.Tools.ImageTokens != 800 {
+		t.Fatalf("set: %+v %v", c.Tools, err)
+	}
+	for _, bad := range []string{`{"tools":{"image_max_bytes":10}}`, `{"tools":{"image_tokens":-1}}`} {
+		os.WriteFile(path, []byte(bad), 0o644)
+		if _, err := Load(path); err == nil {
+			t.Fatalf("accepted %s", bad)
+		}
+	}
+}
+
+func TestMarkdownSetting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.json")
+	os.WriteFile(path, []byte(`{}`), 0o644)
+	if c, err := Load(path); err != nil || !c.Markdown {
+		t.Fatalf("markdown should default to on: %v %v", c.Markdown, err)
+	}
+	os.WriteFile(path, []byte(`{"markdown": false}`), 0o644)
+	if c, err := Load(path); err != nil || c.Markdown {
+		t.Fatalf("markdown false not applied: %v", err)
+	}
+}

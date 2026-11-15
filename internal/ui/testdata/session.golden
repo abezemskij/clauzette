@@ -1,0 +1,138 @@
+Clauzette - Flush your thoughts. · testmodel:latest @ <ollama> · workspace <root>/ws
+· new session S1
+· !help lists the commands. Messages typed before the model is ready are queued.
+[ctx 525/33k · think on · model loading] › · testmodel:latest has no thinking mode; !think has no effect
+[ctx 525/33k · think n/a · model loading] › · testmodel:latest supports up to 66k context tokens; num_ctx caps it at 33k (raise num_ctx for more headroom)
+[ctx 525/33k · think n/a · model loading] › · ollama 0.0.0-test: testmodel:latest is already loaded
+[ctx 525/33k · think n/a · model loading] › · testmodel:latest runs fully on the GPU (1000 B with a 33k-token context)
+[ctx 525/33k · think n/a · model loading] › ⋯ waiting for the model
+Hi there. **Bold** and `code`.
+
+- one
+- two
+[ctx 548/33k · think n/a] › ! testmodel:latest has no thinking mode; !think has no effect
+[ctx 548/33k · think n/a] › · thinking text shown
+[ctx 548/33k · think n/a] › ! unknown command !bogus; type !help for the list, or start a message with !! to send a literal '!'
+[ctx 548/33k · think n/a] › ! unknown command /bogus; type /help
+[ctx 548/33k · think n/a] › · nothing to cancel
+[ctx 548/33k · think n/a] › Context: ~548 of 33k tokens (2%) · testmodel:latest (profile default)
+  model supports up to 66k tokens; num_ctx caps this session at 33k
+  system prompt + tool definitions  ~525
+  user         1 message(s)          ~7
+  assistant    1 message(s)          ~17
+Compaction at ~25k, down to ~9.8k, keeping the last ~4.9k verbatim. Compactions so far: 0.
+Compacting now would change nothing: everything is in the recent part.
+Last request: prompt_eval_count=0, eval_count=3. Estimates use 3.50 characters per token.
+Full transcript: 2 entries (kept in the session file, never compacted).
+[ctx 548/33k · think n/a] › ⋯ waiting for the model
+→ write_file content=‹3 chars› path="a.txt"
+Approval needed (write): create a.txt (1 line)
+--- a/a.txt
++++ b/a.txt
+@@ -0,0 +1,1 @@
++x1
+Approve? y / n [reason] / a (always write_file) / v (view all): Approval needed (write): create a.txt (1 line)
+--- a/a.txt
++++ b/a.txt
+@@ -0,0 +1,1 @@
++x1
+Approve? y / n [reason] / a (always write_file) / v (view all): ! answer y, n (optionally followed by a reason), a or v; or !c to stop the whole turn
+Approve? y / n [reason] / a (always write_file) / v (view all):   ✓ Created a.txt (1 line, 3 B).
+⋯ waiting for the model
+Result noted: Created a.txt (1 line, 3 B).
+[ctx 628/33k · think n/a] › ⋯ waiting for the model
+→ delete_file path="a.txt"
+Approval needed (destructive): delete a.txt (1 line, 3 B)
+Approve? y / n [reason] / a (always delete_file) / v (view all):   ✗ The operator denied this action. Their reason: not now Do not try to reach the same result another way; adjust your plan or ask the operator.
+⋯ waiting for the model
+Result noted: The operator denied this action. Their reason: not now Do not try to reach the same result another way; adjust your plan or ask the operator.
+[ctx 767/33k · think n/a] › · removed the last exchange from the context. Files changed by tools are not restored. The next request re-reads the conversation.
+[ctx 628/33k · think n/a] › · resending: write a file
+⋯ waiting for the model
+→ write_file content=‹3 chars› path="a.txt"
+Approval needed (write): overwrite a.txt (1 → 1 lines)
+--- a/a.txt
++++ b/a.txt
+@@ -1,1 +1,1 @@
+-x1
++x2
+Approve? y / n [reason] / a (always write_file) / v (view all): · write_file will run without asking for the rest of this session (/approvals reset to undo)
+  ✓ Overwrote a.txt (1 line, 3 B).
+⋯ waiting for the model
+Result noted: Overwrote a.txt (1 line, 3 B).
+[ctx 629/33k · think n/a] › · running without approval: write_file (/approvals reset to undo this session's choices)
+[ctx 629/33k · think n/a] › · plan mode on: write/exec/destructive actions are captured, not executed; /plan lists them, /plan approve [n|all] [comment] runs them
+[ctx 629/33k · think n/a] › ⋯ waiting for the model
+→ write_file content=‹2 chars› path="b.txt"
+  ✓ Planned, not executed (pending action 1): create b.txt (1 line) Plan mode is on: the operator reviews the list with /pla…
+⋯ waiting for the model
+Result noted: Planned, not executed (pending action 1): create b.txt (1 line) Plan mode is on: the operator reviews the list with /plan and runs it with /plan approve. Keep reading and refining the plan; do not try to reach the same result through another tool.
+[ctx 929/33k · think n/a] › plan mode: on  (toggle with !plan [on|off])
+When on, write/exec/destructive actions are captured, not executed; read tools still run.
+ 1  write_file     create b.txt (1 line)
+Run them: /plan approve <n ...|all> [comment for the model]  (--no-continue: don't start a model turn)
+Discard:  /plan reject <n ...|all> [reason]
+[ctx 929/33k · think n/a] › ! say which actions the comment goes with: /plan <approve|reject> all looks good, or numbers from /plan (start a comment that begins with a number with --)
+[ctx 929/33k · think n/a] ›   ✓ Created b.txt (1 line, 2 B).
+· running 1 planned action:
+1. write_file: create b.txt (1 line)
+your comment goes to the model with the results
+⋯ waiting for the model
+Plan results seen.
+[ctx 1.0k/33k · think n/a] › · plan mode off: actions run as usual (with approval); 0 pending actions stay in the list
+[ctx 1.0k/33k · think n/a] › · queued; it will be sent when the agent finishes (!c cancels the current work and the queue)
+⋯ waiting for the model
+slow reply
+› queued while busy
+⋯ waiting for the model
+ok: queued while busy
+[ctx 1.1k/33k · think n/a] › ✗ nothing to compact yet: all messages are within the recent part that is always kept
+[ctx 1.1k/33k · think n/a] › safe mode: off  (toggle with !safe [on|off])
+When on, mv_file and delete_file back up their target before running and each needs a fresh 'y';
+exec_command is not backed up (a note is shown with its approval).
+No backups yet for this session.
+[ctx 1.1k/33k · think n/a] › · fetch allowlist gate: off
+· allowed hosts: (none yet; approve a fetch with 'a', or /fetch allow <host>)
+[ctx 1.1k/33k · think n/a] › · added example.com to the fetch allowlist
+[ctx 1.1k/33k · think n/a] › ! ROGUE MODE ON: delete_file, write_file now run without approval
+! per message: up to 100 steps and 60 minutes, until the model calls finish; mv/delete are always backed up first (/safe restore)
+! stop the current task with !c, take back approvals with /rogue off (works mid-task)
+ROGUE [ctx 1.5k/33k · think n/a] › ! rogue mode stays on the model it started with; turn it off first (/rogue off)
+ROGUE [ctx 1.5k/33k · think n/a] › · rogue mode off: actions need approval again from the next one
+[ctx 1.1k/33k · think n/a] › GPU guard is disabled (gpu.enabled is false).
+[ctx 1.1k/33k · think n/a] › · the system prompt (rogue mode uses its own; /rogue on, then /system-prompt shows it):
+NORMAL
+[ctx 1.1k/33k · think n/a] › ! openrouter:free/tooly:free runs on openrouter (<cloud>): from now on this conversation, including the file contents and command output in it, is sent there. Switch? [y/N]
+[ctx 1.1k/33k · think n/a] › · not switched (you typed a command)
+GPU guard is disabled (gpu.enabled is false).
+[ctx 1.1k/33k · think n/a] › ! openrouter:free/tooly:free runs on openrouter (<cloud>): from now on this conversation, including the file contents and command output in it, is sent there. Switch? [y/N]
+[ctx 1.1k/33k · think n/a] › · now using free/tooly:free (profile openrouter:free/tooly:free): 33k-token window; no thinking mode; runs on openrouter: the conversation, and any file or command output in it, is sent there
+[ctx 1.1k/33k · think n/a · cloud: openrouter] › ⋯ waiting for the model
+hello from the cloud
+[ctx 1.1k/33k · think n/a · cloud: openrouter] › · session S2: 0 messages in context
+! the active model runs on openrouter (<cloud>): this conversation, including the file contents and command output in it, is sent there. Send? [y/N]
+[ctx 525/33k · think n/a · cloud: openrouter] › · nothing was sent; you will be asked again with your next message, or /model <local profile> switches to a local model
+[ctx 525/33k · think n/a · cloud: openrouter] › ! the active model runs on openrouter (<cloud>): this conversation, including the file contents and command output in it, is sent there. Send? [y/N]
+⋯ waiting for the model
+hello from the cloud
+[ctx 543/33k · think n/a · cloud: openrouter] › * S2  <time>     2 entries  after new
+  S1  <time>    31 entries  hello
+[ctx 543/33k · think n/a · cloud: openrouter] › ! /clear discards this session's 2-message conversation and starts a new one; files you worked on and safe-mode backups are kept. Clear it? [y/N]
+[ctx 543/33k · think n/a · cloud: openrouter] › · kept the session (you typed a command)
+* S2  <time>     2 entries  after new
+  S1  <time>    31 entries  hello
+[ctx 543/33k · think n/a · cloud: openrouter] › ! /clear discards this session's 2-message conversation and starts a new one; files you worked on and safe-mode backups are kept. Clear it? [y/N]
+[ctx 543/33k · think n/a · cloud: openrouter] › · session S3: 0 messages in context
+! the active model runs on openrouter (<cloud>): this conversation, including the file contents and command output in it, is sent there. Send? [y/N]
+· cleared the previous session (S2)
+[ctx 525/33k · think n/a · cloud: openrouter] › · nothing was sent (you typed a command); you will be asked again with your next message, or /model <local profile> switches to a local model
+· session S1: 20 messages in context
+last reply: hello from the cloud
+[ctx 1.1k/33k · think n/a · cloud: openrouter] › · loading testmodel:latest with num_ctx=32768; this can take a while
+⋯ loading testmodel:latest
+· testmodel:latest loaded in 0s
+· testmodel:latest runs fully on the GPU (1000 B with a 33k-token context)
+· now using testmodel:latest: 33k-token window; no thinking mode
+[ctx 1.1k/33k · think n/a] › ⋯ waiting for the model
+ok: !bang message
+[ctx 1.2k/33k · think n/a] › · session S1 saved; resume with: clauzette -session S1 (or clauzette -resume)

@@ -54,7 +54,8 @@ type Config struct {
 	SharedAccess string `json:"shared_access"` // none | read | write: what the agent may do in the workspace outside its directory
 
 	AuditLog string `json:"audit_log"`
-	Color    string `json:"color"` // auto | always | never
+	Color    string `json:"color"`    // auto | always | never
+	Markdown bool   `json:"markdown"` // render the model's Markdown in the terminal (needs colour); default true
 
 	Prompt   PromptConfig  `json:"prompt"`
 	Context  ContextConfig `json:"context"`
@@ -65,6 +66,17 @@ type Config struct {
 	Rogue    RogueConfig   `json:"rogue"`
 	GPU      GPUConfig     `json:"gpu"`
 	Search   SearchConfig  `json:"search"`
+	Server   ServerConfig  `json:"server"`
+}
+
+// ServerConfig is for clauzette serve and clauzette attach.
+type ServerConfig struct {
+	Listen    string `json:"listen"`     // address to listen on; default 127.0.0.1:8484 (local only)
+	TokenFile string `json:"token_file"` // where serve keeps the token and attach reads it; default <sessions>/server.token
+	Web       bool   `json:"web"`        // serve the web page at / (default true)
+	// UploadMaxBytes is the largest file the web page may upload into
+	// <workspace>/uploads; default 25 MB.
+	UploadMaxBytes int64 `json:"upload_max_bytes"`
 }
 
 // RogueConfig limits /rogue, where actions run without approval. The step
@@ -341,6 +353,10 @@ type ToolsConfig struct {
 
 	FetchAllowlist    bool     `json:"fetch_allowlist"`     // start with the fetch allowlist gate on (toggle at runtime with /fetch)
 	FetchAllowedHosts []string `json:"fetch_allowed_hosts"` // hosts allowed without prompting when the gate is on
+
+	// Images (/image and view_image).
+	ImageMaxBytes int64 `json:"image_max_bytes"` // largest image that can be attached; default 10 MB
+	ImageTokens   int   `json:"image_tokens"`    // fixed context estimate per image; 0 (default) = estimate from the image size
 }
 
 // DefaultFetchUserAgent is the fetch User-Agent default, defined once in the
@@ -395,6 +411,7 @@ func Defaults() *Config {
 		Workspace:    "./workspace",
 		SharedAccess: "read",
 		Color:        "auto",
+		Markdown:     true,
 		Prompt: PromptConfig{
 			ProjectFiles:    []string{"AGENTS.md", "CLAUDE.md"},
 			ProjectMaxBytes: 20000,
@@ -421,6 +438,7 @@ func Defaults() *Config {
 		Agent:  AgentConfig{MaxSteps: 100},
 		Safe:   SafeConfig{MaxBackups: 20},
 		Search: SearchConfig{MaxResults: 5},
+		Server: ServerConfig{Listen: "127.0.0.1:8484", Web: true, UploadMaxBytes: 25 << 20},
 		Rogue:  RogueConfig{MaxMinutes: 60},
 		Tools: ToolsConfig{
 			Shell:                 "/bin/sh",
@@ -431,6 +449,7 @@ func Defaults() *Config {
 			ReadMaxFileBytes:      10 << 20,
 			FetchMaxBytes:         128 << 10,
 			FetchUserAgent:        DefaultFetchUserAgent,
+			ImageMaxBytes:         10 << 20,
 		},
 		GPU: GPUConfig{
 			Mode:          "temperature",
@@ -528,6 +547,9 @@ func Load(path string) (*Config, error) {
 	if c.Tools.FetchMaxBytes < 1 {
 		c.Tools.FetchMaxBytes = 128 << 10
 	}
+	if c.Server.TokenFile == "" {
+		c.Server.TokenFile = filepath.Join(c.AgentSessionsDir(), "server.token")
+	}
 	if c.Tools.FetchUserAgent == "" {
 		c.Tools.FetchUserAgent = DefaultFetchUserAgent
 	}
@@ -561,8 +583,20 @@ func (c *Config) validate() error {
 	if c.Tools.Shell == "" {
 		add("tools.shell is empty")
 	}
+	if c.Tools.ImageMaxBytes < 1024 {
+		add("tools.image_max_bytes must be at least 1024")
+	}
+	if c.Tools.ImageTokens < 0 {
+		add("tools.image_tokens must be 0 (estimate from the image size) or more")
+	}
 	if c.Rogue.MaxMinutes < 0 {
 		add("rogue.max_minutes must be 0 (no limit) or more")
+	}
+	if strings.TrimSpace(c.Server.Listen) == "" {
+		add("server.listen is empty")
+	}
+	if c.Server.UploadMaxBytes < 1 {
+		add("server.upload_max_bytes must be at least 1")
 	}
 	if c.Safe.MaxBackups < 1 {
 		add("safe.max_backups must be at least 1")

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Clauzette</title>
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header>
+  <span class="title">Clauzette</span>
+  <button type="button" id="sessions-btn" class="menu-btn" title="Sessions">Session ▾</button>
+  <button type="button" id="models-btn" class="menu-btn" title="Model">Model ▾</button>
+  <span class="spacer"></span>
+  <button type="button" id="notify-btn" class="icon-btn" title="Notify me when the agent needs me or finishes">🔕</button>
+  <button type="button" id="panel-btn" class="icon-btn" title="Todo, plan and files">☰</button>
+  <span id="conn" class="conn" title="connection">●</span>
+</header>
+<div id="sessions-menu" class="popover" hidden></div>
+<div id="models-menu" class="popover" hidden></div>
+
+<section id="login" hidden>
+  <form id="login-form">
+    <h1>Connect to clauzette serve</h1>
+    <p class="dim">Paste the server token: <code>$CLAUZETTE_SERVER_TOKEN</code>, or the contents of the token file that <code>clauzette serve</code> named when it started.</p>
+    <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="token" required>
+    <label><input id="remember" type="checkbox"> remember on this device</label>
+    <p id="login-error" class="error" hidden></p>
+    <button type="submit">Connect</button>
+  </form>
+</section>
+
+<div id="app" hidden>
+  <div id="main-col">
+    <main id="log" aria-live="polite"></main>
+    <footer id="bottom">
+      <button type="button" id="jump" hidden title="follow the output again">↓ latest</button>
+      <div id="toolbar">
+        <span class="group" id="toggles"></span>
+        <span class="group meter-group">
+          <span id="meter" title="context used; the mark is where compaction runs"><span id="meter-fill"></span><span id="meter-mark"></span></span>
+          <span id="meter-text" class="mono dim"></span>
+          <button type="button" class="small" data-send="/compact" title="/compact">Compact</button>
+        </span>
+        <span class="group">
+          <button type="button" class="small" data-send="/retry" title="/retry: resend your last message">Retry</button>
+          <button type="button" class="small" data-send="/undo" title="/undo: drop the last exchange">Undo</button>
+          <button type="button" class="small" data-send="/context" title="/context">Context</button>
+          <button type="button" class="small" data-send="/help" title="/help">Help</button>
+          <button type="button" class="small" id="upload-btn" title="Upload files into the workspace (uploads/); you can also drop or paste them">📎 Upload</button>
+          <input type="file" id="upload-input" multiple hidden>
+        </span>
+      </div>
+      <div id="status" class="dim"></div>
+      <div id="suggest" class="popover" hidden></div>
+      <form id="send-form">
+        <textarea id="input" rows="1" placeholder="Message, /command or !command  (Enter sends, Shift+Enter: new line, ↑ history)" spellcheck="false"></textarea>
+        <button type="submit" id="send">Send</button>
+        <button type="button" id="stop" title="!c: cancel the current work">Stop</button>
+      </form>
+    </footer>
+  </div>
+  <aside id="panel" hidden>
+    <nav id="tabs">
+      <button type="button" data-tab="todo" class="tab active">Todo</button>
+      <button type="button" data-tab="plan" class="tab">Plan</button>
+      <button type="button" data-tab="files" class="tab">Files</button>
+      <button type="button" id="panel-close" class="icon-btn" title="close">✕</button>
+    </nav>
+    <div id="tab-todo" class="tab-body"></div>
+    <div id="tab-plan" class="tab-body" hidden></div>
+    <div id="tab-files" class="tab-body" hidden>
+      <div id="crumbs" class="mono"></div>
+      <div class="file-actions">
+        <button type="button" class="small" id="changes-btn" title="git diff --stat of the workspace">Changes</button>
+        <button type="button" class="small" id="refresh-files" title="refresh">↻</button>
+      </div>
+      <ul id="file-list"></ul>
+      <div id="viewer" hidden>
+        <div class="viewer-head"><span id="viewer-name" class="mono"></span>
+          <button type="button" class="small" id="viewer-diff">Diff</button>
+          <button type="button" class="small" id="viewer-mention" title="put the path into your message">Mention</button>
+          <button type="button" class="small" id="viewer-close">✕</button></div>
+        <div id="viewer-body"></div>
+      </div>
+    </div>
+  </aside>
+</div>
+<div id="drop" hidden>Drop files to upload them into the workspace (uploads/)</div>
+</body>
+</html>

@@ -22,16 +22,17 @@ The full reference: architecture, building and running (in Kubernetes and locall
 ssh master → tmux → kubectl exec -it deploy/clauzette -- clauzette
                                    │
                     ┌──────────────┴──────────────┐
-                    │ ui      terminal, ! and / commands, approvals
+                    │ ui      terminal: input, rendering, Markdown
+                    │ control ! and / commands, approvals, queue, consent
                     │ agent   session, agent loop, compaction, events
-                    │ tools   read/list/search/write/edit/exec, patch, git, web, fetch, todo
+                    │ tools   read/list/search/write/edit/exec, patch, git, web, fetch, todo, images
                     │ ollama  streaming client, phased timeouts
                     │ gpu     exporter sampling, cool-down pauses
                     └──────────────┬──────────────┘
                      Service ollama:11434 (Ollama pod on the GPU node)
 ```
 
-The `agent` package has no terminal code. It reports everything as events and receives approval decisions through a channel, so a network server or web front end could later drive the same core.
+The `agent` package has no terminal code, and neither does `control`, which implements every command once for any front end: the terminal (`ui`) only reads input and draws what `control` reports through a small `View` interface. It reports everything as events and receives approval decisions through a channel, so a network server or web front end could later drive the same core.
 
 The model is stateless: every request sends the full conversation. Each session keeps two lists. The **context** is what the model sees, and it gets compacted. The **transcript** is the complete record and is never shortened. Both live in one JSON file per session, saved after every step.
 
@@ -40,10 +41,13 @@ cmd/clauzette/      entry point, flags, wiring, "idle" mode for the pod
 internal/config/    JSON config, defaults, validation
 internal/ollama/    /api/chat streaming, load, ps, version
 internal/agent/     agent loop, context and compaction, system prompts, plan and rogue modes, backups, warm-up, audit log
-internal/tools/     tool interface, registry, file tools (read, search, write, edit, mv, delete), exec, apply_patch, read-only git (status/diff/log), web_search, fetch_url, ip_country, todo, diff, path confinement
+internal/tools/     tool interface, registry, file tools (read, search, write, edit, mv, delete), exec, apply_patch, read-only git (status/diff/log), web_search, fetch_url, ip_country, todo, view_image and the image store, diff, path confinement
 internal/session/   session model and store
 internal/gpu/       GPU guard
-internal/ui/        terminal front end
+internal/control/   commands, approvals, queue, cloud consent, model switches (front-end neutral)
+internal/server/    clauzette serve: the controller behind an HTTP API
+internal/wire/      the protocol between serve and attach, the token
+internal/ui/        terminal front end: input and paste handling, rendering, Markdown, prompt
 deploy/             Kubernetes manifests
 ```
 
@@ -194,13 +198,15 @@ Type a message and press Enter. While the agent works, its reply streams in, too
 |---|---|
 | `/context` | Context usage, compaction settings, and what compacting now would keep |
 | `/compact [percent]` | Compact now; with a percent (10–90), summarize that share of the oldest conversation once |
-| `/undo`, `/retry` | Drop the last exchange from the context (and resend it) |
+| `/undo`, `/retry` | Drop the last exchange from the context (and resend it, images included) |
+| `/image <path> [question]` | Send an image with a question; without a question the model describes it. See [Images](#images) |
 | `/sessions`, `/new`, `/load <id>` | List, start or switch sessions |
 | `/clear` | Delete this session's conversation and start a new one, so a throwaway question does not linger in `/sessions`; asks first, and keeps files you worked on, safe-mode backups and the audit log |
 | `/model [name]` | List the profiles and installed models, or switch to a profile or model, local or cloud (see [Model profiles](#configuration)); `--online [filter] [--all]` lists OpenRouter's models |
 | `/adapt [name [--verify]]` | List adapted models, or measure the largest context that keeps a model fully on the GPU; `set <tokens>` and `forget` pin or drop a value |
 | `/system-prompt [reload]` | Show the system prompt in use, or rebuild all three (normal, rogue mode, chat-only) |
 | `/gpu` | GPU guard status |
+| `/markdown [on\|off]` | Render the model's Markdown, or show it as written |
 | `/approvals [reset]` | Tools that run without asking; forget this session's "always" answers |
 | `/safe [restore <n> [force]]` | Safe mode status and backups; restore one |
 | `/fetch [on\|off\|allow <host>\|forget <host>]` | `fetch_url` host allowlist: show it, gate it on/off, or edit it |
@@ -208,9 +214,11 @@ Type a message and press Enter. While the agent works, its reply streams in, too
 | `/rogue [on [steps]\|off]` | [Rogue mode](#rogue-mode): work unattended until the model finishes |
 | `/help`, `/exit` | Help; save and exit |
 
-**Multi-line input:** a line containing only `"""` starts a block, and another one ends it. Pasting several lines at once is also taken as a single message and sent on the next Enter, rather than split into one message per line (via bracketed paste, which clauzette turns on for the session on a terminal; any terminal without it falls back to line-by-line).
+**Multi-line input:** a line containing only `"""` starts a block, and another one ends it. Pasting several lines at once is also taken as a single message and sent on the next Enter, rather than split into one message per line (via bracketed paste, which clauzette turns on for the session on a terminal; any terminal without it falls back to line-by-line). Text you type before or after a paste belongs to the same message, so `download this image <pasted URL>` is sent as one message. A message that begins with pasted text is never run as a command, but a typed command can take a pasted argument (`/image <pasted path>`).
 
-**Typing while the agent works** queues the message; it is sent when the current turn finishes.
+**Typing while the agent works** queues the message; it is sent when the current turn finishes. A y/N question (sending to a cloud endpoint, `/clear`) takes your next line as the answer; a `/` command typed instead counts as "no" and then runs.
+
+**Replies are rendered as Markdown** as they stream: headings in bold, `**bold**`, `*italic*`, `` `code` `` and code blocks in colour, `-`/`*`/`+` bullets as `•`, `>` quotes with a bar, `---` as a line, and `[text](url)` as the underlined text followed by the URL. Code block fences stay visible (dimmed) and code lines are not indented, so code copied from the terminal is clean. Underscores, tables, numbered lists and HTML are shown as written: `_` appears in too many identifiers, and aligning a table would need the whole table before showing any of it. A `*` counts as emphasis only next to a word, so `2 * 3` and `rm *.tmp` stay as they are. Rendering needs colour; `"markdown": false` in the config or `/markdown off` shows replies as written. Either way, control characters in the model's output are removed, so a reply cannot send escape sequences to your terminal.
 
 **Approvals.** Reading, listing and searching run automatically. Writing, editing and running commands ask first, showing a diff or the command:
 
@@ -226,6 +234,73 @@ Approve? y / n [reason] / a (always edit_file) / v (view all):
 `n` with a reason passes the reason to the model. `a` approves that tool for the rest of the session. `tools.auto_approve` in the config makes tools run without asking permanently.
 
 **Exiting.** `!q`, `/exit`, Ctrl+D, Ctrl+C or a dropped connection all cancel running work, save the session and print the command to resume it.
+
+## Server mode: serve and attach
+
+`clauzette serve` runs the session in a server instead of in your terminal; `clauzette attach` connects a terminal to it. The work keeps running when you detach or the connection drops, and several clients can watch and type at once (they see the same output).
+
+```sh
+clauzette serve -config c.json            # same flags as clauzette: -resume, -session, -profile
+clauzette attach -config c.json           # in another terminal; /exit, !q or Ctrl+D detach
+```
+
+`attach` looks and behaves like the terminal: the same commands, approvals, Markdown and paste handling. It shows the last 200 lines of output from before it attached, and after a dropped connection it reconnects and continues where it stopped. `/exit`, `!q` and Ctrl+D detach that client only; the session ends when the server stops (Ctrl+C or SIGTERM), which saves it. `/help` and `/markdown` are handled by each client itself.
+
+**Access.** The server listens on `server.listen`, by default `127.0.0.1:8484`: this machine (or pod) only. Every request needs a token, from `$CLAUZETTE_SERVER_TOKEN`; without it, `serve` creates a random one in `server.token_file` (default `<sessions>/server.token`, mode 0600), where `attach` on the same machine finds it.
+
+Prefer the environment variable. The token is what answers approvals, and commands the agent runs (`exec_command`) run as the same user and can reach the server: with the token they could answer the agent's own approval requests. They never inherit `$CLAUZETTE_SERVER_TOKEN` (like the API keys), the process is non-dumpable so they cannot read it from `/proc`, and the token is redacted from tool output; a token file, though, is readable to them, and `serve` warns when it uses one. From elsewhere, forward the port (`kubectl port-forward`, an SSH tunnel) and pass the token in `$CLAUZETTE_SERVER_TOKEN`; `attach -server http://host:port` (or `$CLAUZETTE_SERVER`) names the server. A listen address other than loopback works but carries the token over plain HTTP, and `serve` warns about it; put TLS in front first. Every refused request and every input (its size, not its text) is recorded in the audit log.
+
+**One owner per session.** A session is open in at most one clauzette at a time: the terminal and the server take a lock (`<session>.lock` next to it, with the process id and host). Opening a session that is open elsewhere is refused with who holds it; a lock left by a process that ended (a crash, `kill -9`) is taken over automatically. Sessions are the same files in both modes, so a session started in the terminal can continue in the server and back.
+
+**Running it.** Locally, run `serve` in tmux or with `nohup`, so it outlives your shell. In the pod, `serve` is the container command (`kubectl exec` would end it on disconnect):
+
+```yaml
+command: ["clauzette", "serve", "-resume", "-take-over"]
+env:
+  - name: CLAUZETTE_SERVER_TOKEN
+    valueFrom:
+      secretKeyRef: {name: clauzette-server, key: token}
+readinessProbe:
+  exec: {command: ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8484"]}
+```
+
+```sh
+openssl rand -hex 32 | tr -d '\n' | kubectl -n ai create secret generic clauzette-server --from-file=token=/dev/stdin
+```
+
+`-resume` continues the latest session, or starts one on an empty state volume. `-take-over` lets a new pod take the session lock the previous pod left behind (a new pod has a new host name, so its lock cannot be checked otherwise; use it only where one process at a time uses the sessions directory). Then `kubectl -n ai exec -it deploy/clauzette -- clauzette attach` connects a terminal (the token is in its environment), and `kubectl -n ai port-forward deploy/clauzette 8484:8484` reaches the web page. Plain `clauzette -resume` in the pod is refused while the server holds the session; `clauzette` alone still starts a separate new session.
+
+**The web page.** `serve` also serves a web page at its address (`http://127.0.0.1:8484/`; `"server": {"web": false}` turns it off). It asks for the token once, keeps it for that browser tab (or on the device, if you tick "remember"), and then shows the same session as `attach`: replies with Markdown and tables (with copy buttons on code and on each reply), thinking (collapsed), tool calls with their full results a click away, approval cards with the diff and Approve / Always / Deny (with an optional reason) buttons, Yes/No buttons for y/N questions, and a Stop button (`!c`). From a phone or another computer, reach it the same way as the API: port forwarding or a tunnel, or TLS in front.
+
+Around the conversation:
+
+- **Header:** the session menu (switch with a click, New, Clear), the model menu (profiles and installed models with what each supports, which is loaded, cloud ones marked; a switch waits for the current work, and a cloud model asks first), notifications, and the side panel.
+- **Toolbar:** toggles for think, show thinking, safe, plan, the fetch allowlist and rogue (which asks first), each showing its state; the context meter with the compaction mark and a Compact button; Retry, Undo, Context, Help and Upload.
+- **Side panel:** the agent's task plan (`todo_write`), plan mode's pending actions with Approve / Reject for each or all, and a read-only file browser for the workspace with a viewer (text with line numbers, images) and the git diff of a file or of the whole workspace.
+- **Input:** exactly what you would type in the terminal. Enter sends, Shift+Enter starts a new line, a message of several lines is sent as text (never as a command), ↑/↓ walk through what you sent, and `/` or `!` suggests commands (Tab completes).
+- **Notifications:** when the tab is in the background, its title shows when an approval or a y/N question waits or the work is done; with the bell on, the browser shows a notification too.
+- **Upload:** the Upload button, dropping files on the page, or pasting them stores them in the workspace under `uploads/` (named `<date>-<time>-<name>`, characters other than letters, digits, `.`, `-` and `_` replaced; nothing is overwritten, unpacked or run; at most `server.upload_max_bytes`, 25 MB). The upload stays out of the conversation: the page offers to mention its path in your message, to ask about an image (`/image`), or to view it, and the agent opens it with its usual tools (`read_file`, `view_image`) when you ask it to. Every upload is recorded in the audit log with its size and hash.
+
+Every action on the page is either a command you could type, or one of the read-only data requests below; the file browser reads through the same workspace confinement as the agent's tools.
+
+The page treats everything the model and the tools produce as untrusted text: it builds the page from text only, never from HTML in a reply, and links in replies work only for `http(s)` addresses. A strict content security policy (only the page's own script and style, no inline script, no other sites, no framing) backs this up. The page itself needs no token to load and contains none; every API call carries it.
+
+The protocol (package `wire`): `GET /api/state`, `POST /api/input` with `{"text": "...", "literal": false}` (exactly what you would type, so approvals and y/N answers need nothing extra) and `GET /api/events?since=N` (server-sent events, resumable with `Last-Event-ID`). For the page: `GET /api/sessions`, `/api/models`, `/api/todos`, `/api/plan`, `/api/files?path=`, `/api/file?path=` (text or an image, at most 2 MB), `/api/diff?path=|stat=1`, and `POST /api/upload?name=`.
+
+## Images
+
+A model with vision (`/model` lists it under what each model supports) can look at PNG, JPEG, WebP and GIF images. It reads them; it cannot draw them, though it can write SVG, HTML or plotting code that renders one.
+
+- **`/image <path> [question]`** sends an image with your question, or asks for a description without one. A relative path is taken from the workspace root; quote a path with spaces. You may name a file outside the workspace: you typed it.
+- **`view_image`** lets the model look at an image in the workspace on its own: a screenshot, a chart it rendered with a script, a photo you dropped in. Like `read_file` it is confined to the workspace and runs without asking. Its result is a line of text; the image itself follows as a separate message, because OpenAI-style APIs accept images only in user messages.
+
+The file type is checked from the file's content, not its name, and an image may be at most `tools.image_max_bytes` (10 MB). Nothing is resized: a larger image is refused with a hint to shrink it (for example with ImageMagick, which the model can run). Attached images are copied into `<sessions>/images/`, named by their SHA-256, and the session stores only that reference. A resumed session therefore sends the exact image the model saw before, even if the original was edited or deleted. Each attached image is recorded in the audit log with its path, size and hash. The image directory is not cleaned up when sessions are deleted (several sessions may share an image); it can be emptied at any time, and an image that is gone becomes a note in the conversation. Key redaction applies to text only: a key that is visible in a screenshot reaches the model.
+
+**Context.** An image costs tokens like text. On Qwen3.8 it is about one token per 32×32 pixels (400×300 ≈ 120 tokens, 1920×1080 ≈ 2,000), and the context estimate uses that. `tools.image_tokens` sets a fixed number per image instead, for models whose encoder counts differently. `/context` shows the images' share. Compaction removes images from the older part of the conversation and leaves a note naming them, so the model can look again with `view_image`; the summary is written from text only.
+
+**Models without vision.** `view_image` is offered only to a model with vision, and `/image` refuses otherwise. If a session with images moves to a model without vision, each image is replaced by a note saying it is not shown, and it is sent again after switching back. If Ollama does not report vision for a model that has it, set `"caps": {"vision": true}` in its profile.
+
+**Cloud models.** Images go to OpenRouter or OpenAI as `image_url` parts with the data inline (a `data:` URL); nothing is fetched from elsewhere, and the local file paths are not sent. Approving a cloud endpoint covers the images in the conversation, like the rest of it.
 
 ## Safe mode
 
@@ -295,6 +370,15 @@ Running unattended removes the last check between the model and `exec_command`. 
 **Tools.** Each tool validates its arguments and prepares an action before anything happens; errors go back to the model as the tool result so it can correct itself. Relative paths start in the workspace root (or the agent's own directory, see [Configuration](#configuration)). Every file operation goes through an `os.Root` handle, which resolves each path component at the moment of the operation: a symlink is followed only while it stays inside, so a directory swapped for a link to somewhere else after you approved an action cannot lead it outside. Symlinks with absolute targets are not followed. Deleting or moving a symlink acts on the link itself, never on its target; reading or writing through a relative link uses the target. `edit_file` uses exact search-and-replace rather than model-written patches, which small models get wrong. The diff you see is computed by clauzette. Because the space is shared, overwriting an existing file requires that the agent read it first, and every write checks that the file has not changed since it was read or since the diff was shown.
 
 **Commands** run with `tools.shell -c` in their own process group, with no input, a timeout and an output cap (the middle of long output is dropped). Cancelling or timing out stops the whole process tree; anything left running in the background is stopped when the command ends.
+
+**Fetching pages.** `fetch_url` decides what to return from the response itself, not only from its `Content-Type`:
+
+- HTML (`text/html`, XHTML, or a body that starts with `<!doctype html` or `<html` whatever its label) is converted to readable text: scripts, styles and markup removed, entities decoded, links kept as a numbered list of absolute URLs at the end, so the model can fetch the next page.
+- With `raw: true` the model gets the body exactly as sent, for when it needs the HTML source or markup itself. The approval prompt shows `raw`.
+- Binary content is never returned, raw or not: a binary type (PDF, archives, images, audio, video, fonts, office documents, executables) or a body with NUL bytes. The model gets one line with the type, the size and a `curl -o` command to download it with `exec_command`, where `file`, `pdftotext`, `unzip -l` or `view_image` can work with it. `application/octet-stream` is judged by its body, since servers also send text files with it.
+- Other text (plain text, JSON, SVG, source files) is returned as it is.
+
+The body is capped at `tools.fetch_max_bytes` (128 KB) after conversion.
 
 **Context and compaction.** Before every model call, clauzette estimates the size of the request. Ollama has no tokenize endpoint, so this is a character-based estimate calibrated against the `prompt_eval_count` Ollama reports; once a request has run, the prompt line and `/context` show Ollama's actual `prompt_eval_count` instead of the estimate. clauzette also asks Ollama (`/api/show`) how much context the model itself supports and reports it at startup and in `/context`, so you can see whether `num_ctx` is capping it (e.g. "model supports up to 262k; num_ctx caps this session at 131k"). The thresholds are shares of the context window (the active profile's `num_ctx`), so they suit models with different windows: by default compaction starts at 75% (`compact_at_fraction`; 98k of a 131k window), stage 1 must get below 30% (`compact_target_fraction`), and the newest 15% (`keep_recent_fraction`) always stays verbatim. When the context reaches the threshold, or the reply might not fit in what is left of the window, it compacts in one step. First it replaces old tool output and large tool-call arguments (file contents) with short placeholders, since the model can re-read files. If that does not get below the target, it asks the model (thinking off) to summarize the older part in a fixed structure: goal, decisions, files and their state, commands, open tasks, preferences. The recent part always stays verbatim, and a tool call is never separated from its result. A `*_tokens` value above 0 (`compact_at_tokens`, `compact_target_tokens`, `keep_recent_tokens`, `summary_chunk_tokens`) replaces its share with a fixed number; if those fixed values do not fit a profile's window, clauzette uses the shares for that profile and says so. The reply reserves are the smaller of `reserve_tokens` (`reserve_tokens_thinking` with thinking on) and their share of the window.
 
@@ -377,4 +461,4 @@ Treat three choices deliberately. Opening internet access lets commands install 
 
 ## Not built yet
 
-An image tool for the model's vision capability, Markdown rendering in the terminal, and a network server mode. The event-based core is designed so these can be added without changing the agent loop. (Page fetching and web search are built — see `fetch_url` and `web_search`, the latter via a configured SearXNG instance. `fetch_url` converts HTML to readable text: it drops scripts, styles and markup, decodes entities, and preserves links as a numbered reference list at the end — each resolved to an absolute URL, deduplicated and capped — so the model, including an unattended rogue-mode run, has real addresses to fetch next without the raw HTML flooding the context. Other content types are returned as-is.)
+A separate client binary for machines that do not run clauzette itself. The event-based core is designed so these can be added without changing the agent loop.

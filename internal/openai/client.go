@@ -260,10 +260,37 @@ type wireCall struct {
 }
 
 type wireMessage struct {
-	Role       string     `json:"role"`
-	Content    *string    `json:"content"` // null for an assistant message that only calls tools
+	Role string `json:"role"`
+	// Content is a string, nil (null, for an assistant message that only
+	// calls tools) or, for a user message with images, a list of wirePart.
+	Content    any        `json:"content"`
 	ToolCalls  []wireCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+// wirePart is one part of a user message with images.
+type wirePart struct {
+	Type     string        `json:"type"` // "text" or "image_url"
+	Text     string        `json:"text,omitempty"`
+	ImageURL *wireImageURL `json:"image_url,omitempty"`
+}
+
+type wireImageURL struct {
+	URL string `json:"url"` // a data: URL; nothing is fetched from elsewhere
+}
+
+// userContent is a user message's content: the text alone, or the text and
+// its images as parts. Images and ImageRefs are in the same order (the
+// agent fills both); the reference gives the MIME type.
+func userContent(m llm.Message) any {
+	if len(m.Images) == 0 || len(m.Images) != len(m.ImageRefs) {
+		return m.Content
+	}
+	parts := []wirePart{{Type: "text", Text: m.Content}}
+	for i, data := range m.Images {
+		parts = append(parts, wirePart{Type: "image_url", ImageURL: &wireImageURL{URL: "data:" + m.ImageRefs[i].MIME + ";base64," + data}})
+	}
+	return parts
 }
 
 type wireRequest struct {
@@ -298,9 +325,10 @@ func (c *Client) buildRequest(req llm.ChatRequest) wireRequest {
 	var pending []string
 	next := 0
 	for _, m := range req.Messages {
-		content := m.Content
-		wm := wireMessage{Role: m.Role, Content: &content}
+		wm := wireMessage{Role: m.Role, Content: m.Content}
 		switch m.Role {
+		case "user":
+			wm.Content = userContent(m)
 		case "assistant":
 			pending = pending[:0]
 			for _, tc := range m.ToolCalls {
@@ -319,7 +347,7 @@ func (c *Client) buildRequest(req llm.ChatRequest) wireRequest {
 				wc.Function.Name, wc.Function.Arguments = tc.Function.Name, string(args)
 				wm.ToolCalls = append(wm.ToolCalls, wc)
 			}
-			if len(wm.ToolCalls) > 0 && content == "" {
+			if len(wm.ToolCalls) > 0 && m.Content == "" {
 				wm.Content = nil
 			}
 		case "tool":
