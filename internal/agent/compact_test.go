@@ -100,3 +100,42 @@ func TestContextReportShowsRatioAndPreview(t *testing.T) {
 		}
 	}
 }
+
+// The prompt count of the last request describes the context before it was
+// rewritten: compaction and undo must drop it so the meter shows the new
+// size, and compaction says so with a usage event straight away.
+func TestCompactAndUndoRefreshUsedTokens(t *testing.T) {
+	r := newRogueRig(t, say("SUMMARY"))
+	events := make(chan Event, 64)
+	r.a.events = events
+	fillConversation(r.a, 20)
+	r.a.sess.LastPromptTokens = 999_999 // what the model reported before compaction
+
+	if err := r.a.Compact(context.Background(), 0.25); err != nil {
+		t.Fatal(err)
+	}
+	est := r.a.ContextTokens()
+	if got := r.a.UsedTokens(); got != est {
+		t.Fatalf("after compaction the meter should show the estimate ~%d, got %d", est, got)
+	}
+	var usage *Usage
+	for len(events) > 0 {
+		if ev := <-events; ev.Kind == EvUsage {
+			u := ev.Usage
+			usage = &u
+		}
+	}
+	if usage == nil || usage.Used != est || usage.NumCtx != r.a.Window() || usage.CompactAt != r.a.CompactAt() || usage.TokPerSec != 0 {
+		t.Fatalf("compaction should end with a usage event for the new size, got %+v", usage)
+	}
+
+	r.a.sess.Append(ollama.Message{Role: "user", Content: "again"}, "")
+	r.a.sess.Append(ollama.Message{Role: "assistant", Content: strings.Repeat("z", 9000)}, "")
+	r.a.sess.LastPromptTokens = 888_888
+	if _, err := r.a.Undo(); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.a.UsedTokens(); got != r.a.ContextTokens() {
+		t.Fatalf("after undo the meter should show the estimate, got %d", got)
+	}
+}

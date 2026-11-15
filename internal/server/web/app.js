@@ -330,6 +330,10 @@ function render(ev) {
     case Ev.Warn: warn(ev.text); break;
     case Ev.Error: line("err", "✗ " + ev.text); break;
     case Ev.Usage:
+      if (ev.usage && ev.usage.NumCtx > 0) {
+        if (status) { status.used_tokens = ev.usage.Used; status.window = ev.usage.NumCtx; status.compact_at = ev.usage.CompactAt; }
+        drawMeter(ev.usage.Used, ev.usage.NumCtx, ev.usage.CompactAt);
+      }
       if (ev.usage && ev.usage.TokPerSec > 0) {
         line("usage", "[" + ev.usage.Eval + " tokens, " + ev.usage.TokPerSec.toFixed(1) + " tok/s · context ~" + ktok(ev.usage.Tokens) + "/" + ktok(ev.usage.NumCtx) + "]");
       }
@@ -446,10 +450,16 @@ function drawStatus() {
   }
   toggleButtons.plan.textContent = "Plan" + (s.plan_pending ? " (" + s.plan_pending + ")" : "");
 
-  const used = s.used_tokens || 0, win = s.window || 1;
+  drawMeter(s.used_tokens, s.window, s.compact_at);
+}
+
+// drawMeter shows the context used. It runs on every status and also on
+// every usage event, so it moves during a long run, not only when it ends.
+function drawMeter(used, win, compactAt) {
+  used = used || 0; win = win || 1;
   $("meter-fill").style.width = Math.min(100, (100 * used) / win) + "%";
-  $("meter-mark").style.left = Math.min(100, (100 * (s.compact_at || win)) / win) + "%";
-  $("meter").classList.toggle("near", !!s.compact_at && used >= 0.85 * s.compact_at);
+  $("meter-mark").style.left = Math.min(100, (100 * (compactAt || win)) / win) + "%";
+  $("meter").classList.toggle("near", !!compactAt && used >= 0.85 * compactAt);
   $("meter-text").textContent = ktok(used) + "/" + ktok(win);
 }
 

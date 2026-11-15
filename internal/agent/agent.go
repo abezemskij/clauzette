@@ -762,6 +762,8 @@ func (a *Agent) Usage(res *ollama.Result) Usage {
 		NumCtx:     a.Window(),
 		PromptEval: a.sess.LastPromptTokens,
 		Eval:       a.sess.LastEvalTokens,
+		Used:       a.UsedTokens(),
+		CompactAt:  a.CompactAt(),
 	}
 	if res != nil {
 		u.TokPerSec = res.TokensPerSecond()
@@ -795,6 +797,7 @@ func (a *Agent) UndoInput() (Input, error) {
 	}
 	in := Input{Text: ctxs[idx].Content, Images: ctxs[idx].ImageRefs}
 	a.sess.Context = ctxs[:idx]
+	a.sess.LastPromptTokens = 0 // it counted what was just removed
 	a.sess.Note("/undo removed the last exchange from the working context")
 	a.Save()
 	return in, nil

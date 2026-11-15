@@ -257,10 +257,12 @@ func (a *Agent) compact(ctx context.Context, ratio float64, lim limits) error {
 	candidate = append(candidate, recent...)
 	if a.entriesTokens(candidate) <= target {
 		a.sess.Context = candidate
+		a.sess.LastPromptTokens = 0 // it counted the old context; estimate until the next request
 		a.sess.Compactions++
 		a.sess.Note("context compacted: old tool output removed")
 		a.info("compacted ~%s → ~%s tokens by removing old tool output", textutil.KTok(before), textutil.KTok(a.ContextTokens()))
 		a.Save()
+		a.emit(Event{Kind: EvUsage, Usage: a.Usage(nil)})
 		return nil
 	}
 
@@ -286,6 +288,7 @@ func (a *Agent) compact(ctx context.Context, ratio float64, lim limits) error {
 	}
 	next = append(next, recent...)
 	a.sess.Context = next
+	a.sess.LastPromptTokens = 0
 	a.sess.Compactions++
 	a.sess.Note(fmt.Sprintf("context compacted: %d older messages replaced by a summary", split))
 	after := a.ContextTokens()
@@ -297,6 +300,7 @@ func (a *Agent) compact(ctx context.Context, ratio float64, lim limits) error {
 		a.warnf("the context is still above the compaction target (~%s); consider lowering context.keep_recent_fraction", textutil.KTok(lim.target))
 	}
 	a.Save()
+	a.emit(Event{Kind: EvUsage, Usage: a.Usage(nil)})
 	return nil
 }
 

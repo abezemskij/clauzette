@@ -37,6 +37,8 @@ type Usage struct {
 	PromptEval int // prompt_eval_count of the last request
 	Eval       int // eval_count of the last request
 	TokPerSec  float64
+	Used       int // what the context meter shows (Agent.UsedTokens)
+	CompactAt  int // where compaction runs
 }
 
 type Decision struct {
