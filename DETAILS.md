@@ -53,7 +53,7 @@ deploy/             Kubernetes manifests
 
 ## Build
 
-Requires Go 1.25 or newer (the Docker build uses 1.26).
+Requires Go 1.25 or newer (the Docker build uses 1.27).
 
 ```sh
 make test        # go test ./...

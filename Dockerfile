@@ -1,5 +1,5 @@
 # --- build ------------------------------------------------------------------
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27-trixie AS build
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod ./
@@ -13,7 +13,7 @@ RUN go vet ./... && go test ./... \
 # installed here, so this image is the agent's toolbox. Add what your
 # projects need (compilers, linters, ...) and remove what you don't want
 # the agent to have (curl, for example, if it should not reach the network).
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 # Links the image to its source repo (e.g. GHCR auto-associates the package).
 LABEL org.opencontainers.image.source="https://github.com/abezemskij/clauzette"
 RUN apt-get update \
